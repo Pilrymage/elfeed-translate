@@ -2,14 +2,13 @@
 #+AUTHOR: pilrymage
 #+LANGUAGE: en
 
-* Overview
 [[./screenshots/display.png]]
 
   =elfeed-translate= translates [[https://github.com/skeeto/elfeed][Elfeed]] RSS entry titles via an LLM API
   (OpenAI-compatible), speeding your daily reading through titles with a more familiar language.
   It generates local feed files containing translated titles,
   creating separate subscription sources to avoid duplicate-entry issues in Elfeed's database.
-  Inspired from [[https://github.com/versun/RSSBox][RSSBox]], a python self-hosted service.
+  Inspired by [[https://github.com/versun/RSSBox][RSSBox]], a python self-hosted service.
 
   The plugin is designed to be /lightweight/: you tag which feeds to
   translate, the plugin translates their entry titles in the
@@ -24,7 +23,7 @@
       :straight (elfeed-translate
                  :type git
                  :host github
-                 :repo "pilrymage/elfeed-translate")
+                 :repo "Pilrymage/elfeed-translate")
       :custom
       (elfeed-translate-api-key "sk-...")
       (elfeed-translate-target-lang "Chinese"))
@@ -54,8 +53,7 @@
   2. Open Elfeed (~M-x elfeed~).  =elfeed-translate= auto-starts and
      loads any cached translations.
 
-  3. Run ~M-x elfeed-translate-show-feeds~.  Copy the displayed
- =file:///= URLs into your feed configuration.
+  3. Run ~M-x elfeed-translate-show-feeds~.  Copy the displayed =file:///= URLs into your feed configuration.
 
   4. Run ~M-x elfeed-update~.  Titles are translated in batches.
 
