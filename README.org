@@ -111,11 +111,9 @@
      translation cache from disk.
 
   2. When you update feeds (~M-x elfeed-update~), Elfeed fetches all
-     feeds.  After entries are added to the database,
- =elfeed-db-update-hook= fires.
+     feeds.  After entries are added to the database, =elfeed-db-update-hook= fires.
 
-  3. The plugin scans all feeds tagged with
- =elfeed-translate-feed-tag=, collects entry titles that are not
+  3. The plugin scans all feeds tagged with =elfeed-translate-feed-tag=, collects entry titles that are not
      in the cache, and sends them to the LLM API in batches
      (default 30 titles per request).
 
@@ -129,9 +127,8 @@
 
 * Translation Cache
 
-  The cache is a persistent hash table stored at
- =~/.elfeed/translated/translate-cache.el=.  It maps /original
-  titles/ to /translated titles/.  The cache is:
+  The cache is a persistent hash table stored at =~/.elfeed/translated/translate-cache.el=.
+  It maps /original titles/ to /translated titles/.  The cache is:
 
   - Loaded automatically when Elfeed opens
   - Saved after each completed batch translation
@@ -142,9 +139,9 @@
 
 * Local RSS Files
 
-  Translated feeds are stored as RSS 2.0 XML files in
- =~/.elfeed/translated/= with stable filenames: the MD5 hash of the
-  original feed URL.  This means the same feed always produces the
+  Translated feeds are stored as RSS 2.0 XML files in =~/.elfeed/translated/=
+  with stable filenames: the MD5 hash of the original feed URL.
+  This means the same feed always produces the
   same local file path, making it safe to hard-code in your
   configuration.
 
