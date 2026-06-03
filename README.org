@@ -1,0 +1,194 @@
+#+TITLE: elfeed-translate
+#+AUTHOR: pilrymage
+#+LANGUAGE: en
+
+* Overview
+
+  =elfeed-translate= translates [[https://github.com/skeeto/elfeed][Elfeed]] RSS entry titles via an LLM API
+  (OpenAI-compatible).  It generates local RSS 2.0 XML files containing
+  translated titles, creating separate subscription sources to avoid
+  duplicate-entry issues in Elfeed's database.
+
+  The plugin is designed to be /lightweight/: you tag which feeds to
+  translate, the plugin translates their entry titles in the
+  background, and you subscribe to the translated local RSS files
+  alongside your original feeds.  All translations are cached so only
+  new entries consume API quota.
+
+* Installation
+
+  #+begin_src elisp
+    (use-package elfeed-translate
+      :straight (elfeed-translate
+                 :type git
+                 :host github
+                 :repo "pilrymage/elfeed-translate")
+      :custom
+      (elfeed-translate-api-key "sk-...")
+      (elfeed-translate-target-lang "Chinese"))
+  #+end_src
+
+  Requires Emacs ≥ 27.1 and Elfeed ≥ 3.0.
+
+* Quick Start
+
+  1. Tag the feeds you want translated in =elfeed-feeds=:
+
+     #+begin_src elisp
+       (setq elfeed-feeds
+             '(("https://example.com/en/rss" translate-title blog)
+               "https://example.com/zh/rss"))  ;; this one won't be translated
+     #+end_src
+
+     Or in =elfeed-org= format:
+
+     #+begin_example
+       * English Blogs :translate_title:
+       ** https://example.com/en/rss
+       * 中文博客
+       ** https://example.com/zh/rss
+     #+end_example
+
+  2. Open Elfeed (~M-x elfeed~).  =elfeed-translate= auto-starts and
+     loads any cached translations.
+
+  3. Run ~M-x elfeed-translate-show-feeds~.  Copy the displayed
+ =file:///= URLs into your feed configuration.
+
+  4. Run ~M-x elfeed-update~.  Titles are translated in batches.
+
+  5. Run ~M-x elfeed-update~ again to fetch the translated local RSS
+     files and see translated titles in the search buffer.
+
+* Configuration
+
+  All customization options are in the =elfeed-translate= group
+  (~M-x customize-group RET elfeed-translate RET~).
+
+  | Variable                             | Default                                  | Description                                  |
+  |--------------------------------------+------------------------------------------+----------------------------------------------|
+  | =elfeed-translate-api-key=           | ="=                                      | API key (OpenAI-compatible)                  |
+  | =elfeed-translate-api-url=           | =https://api.openai.com/...=             | Chat completions endpoint                    |
+  | =elfeed-translate-model=             | =gpt-4o-mini=                            | Model name                                   |
+  | =elfeed-translate-target-lang=       | =Chinese=                                | Target language                              |
+  | =elfeed-translate-feed-tag=          | =translate_title=                        | Autotag marking feeds for translation        |
+  | =elfeed-translate-feed-title-prefix= | =[TL]=                                   | Prefix on translated feed titles             |
+  | =elfeed-translate-title-style=       | =replace=                                | How to format translated entry titles        |
+  | =elfeed-translate-title-separator=   | =" :: "=                                 | Separator in bilingual modes                 |
+  | =elfeed-translate-tag=               | =translated=                             | Tag applied to translated feed entries       |
+  | =elfeed-translate-batch-size=        | =30=                                     | Max titles per API request                   |
+  | =elfeed-translate-temperature=       | =0.3=                                    | API temperature                              |
+  | =elfeed-translate-output-dir=        | =~/.elfeed/translated/=                  | Where translated RSS XML files are stored    |
+  | =elfeed-translate-debug=             | =nil=                                    | Enable detailed API request/response logging |
+
+* Title Display Modes
+
+  =elfeed-translate-title-style= controls how translated titles appear
+  in the generated RSS:
+
+  | Value            | Example                                                     |
+  |------------------+-------------------------------------------------------------|
+  | =replace=        | /ChatGPT 发布新版本/                                        |
+  | =target-first=   | /ChatGPT 发布新版本 :: OpenAI Announces GPT-5/               |
+  | =original-first= | /OpenAI Announces GPT-5 :: ChatGPT 发布新版本/               |
+
+  The separator is controlled by =elfeed-translate-title-separator=.
+
+* Commands
+
+  | Command                            | Description                                                      |
+  |------------------------------------+------------------------------------------------------------------|
+  | ~M-x elfeed-translate-show-feeds~  | Show translated feed URLs (org or Elisp format) for copy-paste   |
+  | ~M-x elfeed-translate-update~      | Manually trigger translation of all tagged feeds                 |
+  | ~M-x elfeed-translate-clear-cache~ | Clear all cached translations (re-translate on next update)      |
+  | ~M-x elfeed-translate-stats~       | Show per-feed translation statistics                             |
+  | ~M-x global-elfeed-translate-mode~ | Toggle automatic translation on/off                              |
+
+* How It Works
+
+  1. When you open Elfeed (~M-x elfeed~), =elfeed-translate-setup=
+     runs automatically via =elfeed-search-mode-hook=.  It loads the
+     translation cache from disk.
+
+  2. When you update feeds (~M-x elfeed-update~), Elfeed fetches all
+     feeds.  After entries are added to the database,
+ =elfeed-db-update-hook= fires.
+
+  3. The plugin scans all feeds tagged with
+ =elfeed-translate-feed-tag=, collects entry titles that are not
+     in the cache, and sends them to the LLM API in batches
+     (default 30 titles per request).
+
+  4. Each batch response is parsed, results are stored in the cache,
+     and the cache is persisted to disk.  When all batches complete,
+     the local RSS 2.0 XML files are regenerated.
+
+  5. On your next =M-x elfeed-update=, Elfeed fetches the updated
+     local RSS files.  Translated entries appear in the search buffer
+     with the =translated= tag.
+
+* Translation Cache
+
+  The cache is a persistent hash table stored at
+ =~/.elfeed/translated/translate-cache.el=.  It maps /original
+  titles/ to /translated titles/.  The cache is:
+
+  - Loaded automatically when Elfeed opens
+  - Saved after each completed batch translation
+  - Transparent to the user (no manual management needed)
+
+  To force re-translation of everything (e.g., after changing the
+  target language), use ~M-x elfeed-translate-clear-cache~.
+
+* Local RSS Files
+
+  Translated feeds are stored as RSS 2.0 XML files in
+ =~/.elfeed/translated/= with stable filenames: the MD5 hash of the
+  original feed URL.  This means the same feed always produces the
+  same local file path, making it safe to hard-code in your
+  configuration.
+
+  Example:
+
+  #+begin_example
+    ~/.elfeed/translated/cc8050a6ebc85084b4d900db7c616ebb.xml
+  #+end_example
+
+  Each file contains only entries that have been translated (are in
+  the cache).  Entry GUIDs are prefixed with the feed hash to prevent
+  ID collisions between different translated feeds.
+
+* Integration with elfeed-org
+
+  If =elfeed-org= is loaded, =M-x elfeed-translate-show-feeds=
+  produces output in org-mode format:
+
+  #+begin_example
+    ,** Translated feeds :translated:
+    ,*** [[file:///.../abc123.xml][[TL] Example Blog]]
+        :PROPERTIES:
+        :ORIGINAL-FEED: https://example.com/en/rss
+        :END:
+  #+end_example
+
+  Copy these headlines into your =elfeed-org= file below an existing
+  level-1 feed group.
+
+* Debugging
+
+  Set =elfeed-translate-debug= to =t= to enable detailed logging to
+  the =*Messages*= buffer:
+
+  #+begin_src elisp
+    (setq elfeed-translate-debug t)
+  #+end_src
+
+  Log output includes:
+  - API endpoint, model, and first title being sent
+  - Raw HTTP response body (first 500 characters)
+  - Parsed JSON keys
+  - Translation result (success/failure with pair count)
+
+* License
+
+  GPL-3.0-or-later
