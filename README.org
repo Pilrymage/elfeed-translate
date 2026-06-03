@@ -3,11 +3,13 @@
 #+LANGUAGE: en
 
 * Overview
+[[./screenshots/display.png]]
 
   =elfeed-translate= translates [[https://github.com/skeeto/elfeed][Elfeed]] RSS entry titles via an LLM API
-  (OpenAI-compatible).  It generates local RSS 2.0 XML files containing
-  translated titles, creating separate subscription sources to avoid
-  duplicate-entry issues in Elfeed's database.
+  (OpenAI-compatible), speeding your daily reading through titles with a more familiar language.
+  It generates local feed files containing translated titles,
+  creating separate subscription sources to avoid duplicate-entry issues in Elfeed's database.
+  Inspired from [[https://github.com/versun/RSSBox][RSSBox]], a python self-hosted service.
 
   The plugin is designed to be /lightweight/: you tag which feeds to
   translate, the plugin translates their entry titles in the
@@ -36,7 +38,7 @@
 
      #+begin_src elisp
        (setq elfeed-feeds
-             '(("https://example.com/en/rss" translate-title blog)
+             '(("https://example.com/en/rss" translate_title blog)
                "https://example.com/zh/rss"))  ;; this one won't be translated
      #+end_src
 
