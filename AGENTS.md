@@ -92,9 +92,9 @@ M-x elfeed-update → Elfeed fetches feeds → entries added to elfeed-db
       ├─ split into batches (elfeed-translate-batch-size, default 30)
       └─ if elfeed-translate-parallel:
            elfeed-translate--process-batches-parallel
-             submit all batches → url-queue-retrieve (async, capped at
-               elfeed-translate-max-concurrent in-flight) → each callback
-               cache-set → on last completion: save-cache + finalize
+             dispatch up to elfeed-translate-max-concurrent batches →
+               url-retrieve (async) → each callback cache-set + dispatch
+               next pending batch → on last completion: save-cache + finalize
          else:
            elfeed-translate--process-batches  (recursive async chain)
              each batch → url-retrieve (async) → parse JSON → cache-set
@@ -201,19 +201,40 @@ to regress:
    slow response arriving after timeout will double-invoke the callback and
    corrupt batch counters.
 
-10. **Parallel mode sets `url-queue-max-threads` globally, not via `let`.**
-    `url-queue` reads `url-queue-max-threads` both when submitting and when a
-    request completes and the next queued item starts, so a `let`-bind would
-    not cover completion-driven wakeups. `--process-batches-parallel` saves
-    the old value, `setq`s the global, and `finalize-fn` restores it. If you
-    refactor the finalize path, ensure the restore still runs or other
-    `url-queue` users will see the altered limit.
+10. **Never use `url-queue-retrieve` for API calls.** `url-queue-retrieve`
+    defers the actual `url-retrieve` to an idle timer (0.01s later), which
+    runs *outside* the `let*` that binds `url-request-method`,
+    `url-request-extra-headers`, and `url-request-data`. The request is then
+    sent as a bodyless GET → HTTP 404. Parallel mode implements its own
+    concurrency limiter in `--process-batches-parallel` (a queue +
+    `in-flight` counter) that calls `url-retrieve` directly via `--call-api`,
+    keeping the `let*` bindings in scope. Do not switch back to
+    `url-queue-retrieve`.
 
-11. **`--call-api` selects the transport by `elfeed-translate-parallel`.** It
-    calls `url-queue-retrieve` in parallel mode and `url-retrieve` in serial
-    mode. Both share the same watchdog + `done`-flag logic. The
-    `no-busy-guard` optional arg lets the parallel dispatcher bypass the
-    per-request busy lock so multiple requests can be in flight.
+11. **`--call-api` always uses `url-retrieve`** (not `url-queue-retrieve`).
+    The `no-busy-guard` optional arg lets the parallel dispatcher bypass the
+    per-request busy lock so multiple requests can be in flight. Both serial
+    and parallel paths share the same watchdog + `done`-flag logic.
+
+12. **HTTP 4xx/5xx responses skip JSON parsing.** `--parse-response` checks
+    the HTTP status first via `--http-status`; on ≥ 400 it throws
+    `parse-error` immediately instead of feeding an HTML error page to
+    `json-parse-string`, which produces confusing error messages.
+
+13. **`elfeed-translate-test-api`** sends a minimal "Hello" prompt to the
+    configured API and displays the raw HTTP response (headers + body) in a
+    pop-up buffer. Use it to diagnose 404s, auth failures, or wrong model
+    names before running a full translation cycle.
+
+14. **Parallel dispatch state lives in a `defvar`, not `let*` closures.**
+    `elfeed-translate--parallel-state` (a plist) holds the queue, in-flight
+    counter, completed count, etc. `--parallel-callback` and
+    `--parallel-dispatch` are top-level `defun`s that read/write this
+    variable. This avoids the Emacs Lisp interpreter's failure to capture
+    `let*`/`letrec`-bound variables inside lambdas invoked from process
+    filters (async `url-retrieve` callbacks) — the byte-compiler handles
+    self-referential closures fine, but `eval-buffer` does not. Do not
+    refactor back to `let*` closures.
 
 ## Elfeed Integration Points
 
