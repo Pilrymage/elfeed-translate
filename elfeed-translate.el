@@ -875,7 +875,7 @@ for the whole cycle and cleared on completion."
         (message
          "[elfeed-translate] Submitting batch %d/%d (%d titles)..."
          dispatched total (length batch))
-        (elfeed-translate--call-api batch batch-callback t))))
+        (elfeed-translate--call-api batch batch-callback t)))))
 
 (defun elfeed-translate--on-db-update ()
   "Handle `elfeed-db-update-hook': translate new titles, update RSS files.
