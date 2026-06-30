@@ -32,6 +32,7 @@
 (require 'elfeed)
 (require 'elfeed-db)
 (require 'url)
+(require 'url-queue)
 (require 'json)
 (require 'xml)
 (require 'subr-x)
@@ -167,9 +168,38 @@ Useful for diagnosing translation failures."
 
 (defcustom elfeed-translate-batch-size 30
   "Maximum number of titles sent in a single API request.
-Titles exceeding this count are split into multiple sequential
+Titles exceeding this count are split into multiple batched
 requests to keep each batch manageable for the model."
   :type 'integer
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-parallel nil
+  "When non-nil, dispatch translation batches concurrently.
+Parallel mode submits all batches to `url-queue-retrieve' which
+keeps at most `elfeed-translate-max-concurrent' API requests in
+flight at once, which is faster for AI endpoints with quick
+responses.  When nil, batches are processed sequentially: each
+request waits for the previous one to complete before sending,
+which is safer for slow or rate-limited endpoints."
+  :type 'boolean
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-max-concurrent 4
+  "Maximum number of API requests in flight simultaneously.
+Used only in parallel mode.  Each batch is still capped at
+`elfeed-translate-batch-size' titles.  Has no effect when
+`elfeed-translate-parallel' is nil."
+  :type 'integer
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-request-timeout 60
+  "Maximum seconds to wait for a single API response.
+If the response does not arrive within this period the request is
+aborted and treated as a failure, preventing a stalled network
+connection from blocking translation indefinitely.  Set to nil or
+0 to disable the timeout."
+  :type '(choice (const :tag "No timeout" nil)
+                 (integer :tag "Seconds"))
   :group 'elfeed-translate)
 
 ;; ═══════════════════════════════════════════════════════════════════════
@@ -373,19 +403,27 @@ path to the generated file."
 ;; ═══════════════════════════════════════════════════════════════════════
 
 (defvar elfeed-translate--busy nil
-  "Non-nil while a translation API request is in-flight.
-Prevents concurrent API calls that would waste quota.")
+  "Non-nil while a translation cycle is active.
+In serial mode this is set per API request and cleared on completion.
+In parallel mode it is held for the whole dispatch cycle and cleared
+once every batch has completed.  `elfeed-translate--on-db-update'
+checks this to avoid starting overlapping cycles.")
 
-(defun elfeed-translate--call-api (titles callback)
+(defun elfeed-translate--call-api (titles callback &optional no-busy-guard)
   "Translate TITLES (list of strings) via the configured LLM API.
 CALLBACK receives one argument: an alist of (original . translated)
 pairs on success, or nil on failure.
 
 The titles are sent as a single batch, separated by '---' markers.
 The API response is expected to contain translated titles separated
-by the same marker."
+by the same marker.
+
+When NO-BUSY-GUARD is non-nil, neither check nor touch
+`elfeed-translate--busy'.  Used by parallel dispatch
+\(`elfeed-translate--process-batches-parallel') which manages the lock
+at the cycle level and allows several requests in flight at once."
   (cond
-   (elfeed-translate--busy
+   ((and (not no-busy-guard) elfeed-translate--busy)
     (message "[elfeed-translate] API call already in progress, skipping")
     (when callback (funcall callback nil)))
    ((null elfeed-translate-api-key)
@@ -394,7 +432,7 @@ by the same marker."
    ((null titles)
     (when callback (funcall callback nil)))
    (t
-    (setq elfeed-translate--busy t)
+    (unless no-busy-guard (setq elfeed-translate--busy t))
     (let* ((system-prompt (format elfeed-translate-system-prompt
                                   elfeed-translate-target-lang))
            (user-content (string-join titles "\n---\n"))
@@ -423,34 +461,87 @@ by the same marker."
                      (substring (car titles) 0 (min 80 (length (car titles))))
                    "N/A")))
       (condition-case err
-          (url-retrieve elfeed-translate-api-url
-                        (lambda (_status)
-                          (unwind-protect
-                              (let ((result
-                                     (condition-case parse-err
-                                         (elfeed-translate--parse-response
-                                          titles (current-buffer))
-                                       (error
-                                        (message
-                                         "[elfeed-translate] Parse error: %s"
-                                         (error-message-string parse-err))
-                                        nil))))
-                                (setq elfeed-translate--busy nil)
-                                (when elfeed-translate-debug
-                                  (message "[elfeed-translate] API response parsed: %s"
-                                           (if result
-                                               (format "%d pairs" (length result))
-                                             "FAILED")))
-                                (funcall callback result))
-                            ;; Safety net: if the callback throws, ensure
-                            ;; busy is still cleared so future updates
-                            ;; are not permanently blocked.
-                            (setq elfeed-translate--busy nil)))
-                        nil 'silent)
+          (let ((retrieve-fn
+                 (if elfeed-translate-parallel
+                     #'url-queue-retrieve
+                   #'url-retrieve))
+                (done nil)
+                (timeout-timer nil)
+                (response-buffer nil))
+            ;; Watchdog: if the response does not arrive within
+            ;; `elfeed-translate-request-timeout' seconds, mark the
+            ;; request done and invoke the callback with nil, preventing
+            ;; a stalled connection from leaving `--busy' set forever.
+            ;; The orphaned process (if any) is killed when its buffer
+            ;; is eventually garbage-collected; the response callback
+            ;; checks `done' and skips if the watchdog already fired.
+            (when (and elfeed-translate-request-timeout
+                       (> elfeed-translate-request-timeout 0))
+              (setq timeout-timer
+                    (run-at-time
+                     elfeed-translate-request-timeout nil
+                     (lambda ()
+                       (unless done
+                         (setq done t)
+                         (when (and response-buffer
+                                    (buffer-live-p response-buffer))
+                           (let ((proc (get-buffer-process response-buffer)))
+                             (when proc (delete-process proc))))
+                         (message
+                          "[elfeed-translate] Request timed out after %ds"
+                          elfeed-translate-request-timeout)
+                         (unless no-busy-guard
+                           (setq elfeed-translate--busy nil))
+                         (when callback (funcall callback nil)))))))
+            (funcall
+             retrieve-fn
+             elfeed-translate-api-url
+             (lambda (_status)
+               ;; Record the response buffer so the watchdog can kill
+               ;; its process if it fires before we finish.
+               (setq response-buffer (current-buffer))
+               (if done
+                   ;; Watchdog already fired — discard this late response.
+                   (progn
+                     (when timeout-timer
+                       (cancel-timer timeout-timer)
+                       (setq timeout-timer nil)))
+                 (unwind-protect
+                     (let ((result
+                            (condition-case parse-err
+                                (elfeed-translate--parse-response
+                                 titles (current-buffer))
+                              (error
+                               (message
+                                "[elfeed-translate] Parse error: %s"
+                                (error-message-string parse-err))
+                               nil))))
+                       (setq done t)
+                       (when timeout-timer
+                         (cancel-timer timeout-timer)
+                         (setq timeout-timer nil))
+                       (unless no-busy-guard
+                         (setq elfeed-translate--busy nil))
+                       (when elfeed-translate-debug
+                         (message "[elfeed-translate] API response parsed: %s"
+                                  (if result
+                                      (format "%d pairs" (length result))
+                                    "FAILED")))
+                       (funcall callback result))
+                   ;; Safety net: if the callback throws, ensure busy is
+                   ;; still cleared so future updates are not permanently
+                   ;; blocked (serial mode).
+                   (unless done
+                     (when timeout-timer
+                       (cancel-timer timeout-timer)
+                       (setq timeout-timer nil)))
+                   (unless no-busy-guard
+                     (setq elfeed-translate--busy nil)))))
+             nil 'silent))
         (error
          (message "[elfeed-translate] Failed to send API request: %s"
                   (error-message-string err))
-         (setq elfeed-translate--busy nil)
+         (unless no-busy-guard (setq elfeed-translate--busy nil))
          (funcall callback nil)))))))
 
 (defun elfeed-translate--extract-body (buffer)
@@ -723,10 +814,74 @@ number of batches (for progress reporting)."
            (elfeed-translate--save-cache)
            (elfeed-translate--finalize title->feeds)))))))
 
+(defun elfeed-translate--process-batches-parallel (batches title->feeds total-batches)
+  "Process BATCHES concurrently via `url-queue-retrieve'.
+All batches are submitted at once; the URL queue keeps at most
+`elfeed-translate-max-concurrent' API requests in flight
+simultaneously.  Each batch is still capped at
+`elfeed-translate-batch-size' titles.  The cache is saved and
+affected RSS files regenerated once every batch has completed.
+
+TITLE->FEEDS maps titles → feed-urls (used by `elfeed-translate--finalize').
+TOTAL-BATCHES is the total number of batches (for progress reporting).
+
+Unlike `elfeed-translate--process-batches', this function does not
+wait for a batch's response before sending the next; `--busy' is held
+for the whole cycle and cleared on completion."
+  (if (null batches)
+      (message "[elfeed-translate] No batches to process")
+    (let* ((total total-batches)
+           (dispatched 0)
+           (in-flight 0)
+           (completed 0)
+           (saved-queue-threads url-queue-max-threads)
+           (finalize-fn
+            (lambda ()
+              (when (= in-flight 0)
+                ;; Restore the global queue limit before finalising so
+                ;; other URL-queue users see the original value.
+                (setq url-queue-max-threads saved-queue-threads)
+                (elfeed-translate--save-cache)
+                (elfeed-translate--finalize title->feeds)
+                (setq elfeed-translate--busy nil))))
+           (batch-callback
+            (lambda (pairs)
+              (unwind-protect
+                  (progn
+                    (cl-decf in-flight)
+                    (cl-incf completed)
+                    (if pairs
+                        (progn
+                          (dolist (pair pairs)
+                            (elfeed-translate--cache-set (car pair) (cdr pair)))
+                          (message
+                           "[elfeed-translate] Batch completed: %d ok (%d/%d)"
+                           (length pairs) completed total))
+                      (message "[elfeed-translate] Batch FAILED (%d/%d)"
+                               completed total)))
+                (funcall finalize-fn)))))
+      ;; Cap the URL queue's concurrency for this whole cycle.
+      ;; `url-queue-max-threads' is a global variable read by the queue
+      ;; both when submitting and when a request completes and the next
+      ;; queued item is started, so a let-bind would not cover the
+      ;; completion-driven wakeups.  We set it globally and restore the
+      ;; original value in `finalize-fn' once every batch is done.
+      (setq elfeed-translate--busy t)
+      (setq url-queue-max-threads
+            (max 1 elfeed-translate-max-concurrent))
+      (dolist (batch batches)
+        (cl-incf in-flight)
+        (cl-incf dispatched)
+        (message
+         "[elfeed-translate] Submitting batch %d/%d (%d titles)..."
+         dispatched total (length batch))
+        (elfeed-translate--call-api batch batch-callback t))))
+
 (defun elfeed-translate--on-db-update ()
   "Handle `elfeed-db-update-hook': translate new titles, update RSS files.
 Splits large title sets into batches (see `elfeed-translate-batch-size')
-and processes them sequentially via async API calls."
+and processes them via async API calls, either sequentially or in
+parallel depending on `elfeed-translate-parallel'."
   (when (and (not elfeed-translate--busy)
              (elfeed-translate--translatable-feeds))
     (let ((items (elfeed-translate--collect-untranslated)))
@@ -746,8 +901,11 @@ and processes them sequentially via async API calls."
                    (length titles)
                    (length batches)
                    (length (delete-dups (mapcar #'car items))))
-          (elfeed-translate--process-batches
-           batches title->feeds (length batches)))))))
+          (if elfeed-translate-parallel
+              (elfeed-translate--process-batches-parallel
+               batches title->feeds (length batches))
+            (elfeed-translate--process-batches
+             batches title->feeds (length batches))))))))
 
 ;; ═══════════════════════════════════════════════════════════════════════
 ;; Public Commands
