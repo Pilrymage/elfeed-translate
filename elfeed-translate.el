@@ -1,31 +1,40 @@
-;;; elfeed-translate.el --- Translate Elfeed entry titles via LLM API -*- lexical-binding: t; -*-
+;;; elfeed-translate.el --- Translate Elfeed entry titles and content via LLM API -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 ;; URL: https://github.com/pilrymage/elfeed-translate
 
 ;;; Commentary:
 
-;; This package translates Elfeed RSS entry titles using an LLM API
-;; (OpenAI-compatible).  It generates local RSS XML files containing
-;; translated titles, creating separate subscription sources to avoid
-;; duplicate entry issues in Elfeed's database.
+;; This package translates Elfeed RSS entry titles and content using
+;; an LLM API (OpenAI-compatible).  It generates local RSS XML files
+;; containing translated content, creating separate subscription
+;; sources to avoid duplicate entry issues in Elfeed's database.
+;;
+;; Title translation and content translation are fully independent:
+;; a feed can be tagged with `translate_title' only, `translate_content'
+;; only, or both.  Each uses its own system prompt and batch size.
+;; Content is truncated to a configurable maximum before translation.
+;;
+;; All translations are cached by the MD5 hash of the source text,
+;; making the cache flat (string key -> string value) and ready for
+;; future SQLite migration.
 ;;
 ;; Usage:
 ;;   1. Tag the feeds you want translated in `elfeed-feeds':
 ;;        (setq elfeed-feeds
-;;              \\='((\"https://example.com/en/rss\" translate-title)))
+;;              \\='((\"https://example.com/en/rss\" translate_title translate_content)))
 ;;      Or in elfeed-org format:
-;;        * English Blogs :translate_title:
+;;        * English Blogs :translate_title:translate_content:
 ;;        ** https://example.com/en/rss
 ;;   2. Configure `elfeed-translate-api-key'
 ;;   3. M-x elfeed-translate-setup  (or enable `global-elfeed-translate-mode')
-;;   4. M-x elfeed-translate-show-feeds    copy the file:// URLs into your
+;;   4. M-x elfeed-translate-show-feeds  → copy the file:// URLs into your
 ;;      feed configuration (elfeed-org file or `elfeed-feeds')
-;;   5. M-x elfeed-update    titles get translated, RSS files regenerated
-;;   6. Another M-x elfeed-update    translated titles appear
+;;   5. M-x elfeed-update  → titles/content get translated, RSS files regenerated
+;;   6. Another M-x elfeed-update  → translated content appears
 
 ;;; Code:
 
@@ -38,13 +47,13 @@
 (require 'cl-lib)
 (require 'seq)
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Customization
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defgroup elfeed-translate nil
-  "Translate Elfeed entry titles using LLM APIs.
-Generates local RSS files with translated titles as separate
+  "Translate Elfeed entry titles and content using LLM APIs.
+Generates local RSS files with translated content as separate
 subscription sources."
   :group 'elfeed)
 
@@ -67,7 +76,7 @@ Must implement the OpenAI /v1/chat/completions protocol."
   :group 'elfeed-translate)
 
 (defcustom elfeed-translate-target-lang "Chinese"
-  "Target language for title translation."
+  "Target language for translation."
   :type 'string
   :group 'elfeed-translate)
 
@@ -82,6 +91,24 @@ Compatible with both `elfeed-feeds' format:
 
 and `elfeed-org' format:
   * Blogs :translate_title:
+  ** https://example.com/rss"
+  :type 'symbol
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-content-tag 'translate_content
+  "Tag that marks a feed for content translation.
+Feeds with this autotag will have their entry content
+(RSS <description> / Atom <content>) translated independently of
+titles.  Can be used alone (title not translated) or together with
+`elfeed-translate-feed-tag'.  Content is truncated to
+`elfeed-translate-content-max-chars' characters before translation.
+
+Compatible with both `elfeed-feeds' format:
+  (setq elfeed-feeds
+        \\='((\"https://example.com/rss\" translate_content)))
+
+and `elfeed-org' format:
+  * Blogs :translate_content:
   ** https://example.com/rss"
   :type 'symbol
   :group 'elfeed-translate)
@@ -111,15 +138,45 @@ Each configured feed gets its own file named <hash>.xml."
    "---\n"
    "How to build a REST API with Flask\n"
    "---\n"
-   "    \n\n"
+   "今日天气\n\n"
    "EXAMPLE OUTPUT:\n"
-   "     OpenAI    GPT-5   \n"
+   "突发新闻：OpenAI 发布 GPT-5 模型\n"
    "---\n"
-   "     Flask    REST API\n"
+   "如何使用 Flask 构建 REST API\n"
    "---\n"
-   "    ")
-  "System prompt template for the translation API.
+   "今日天气")
+  "System prompt template for title translation.
 %s is replaced with `elfeed-translate-target-lang'."
+  :type 'string
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-content-system-prompt
+  (concat
+   "You are a translator. Translate each RSS feed content snippet below into %s.\n\n"
+   "CRITICAL OUTPUT FORMAT:\n"
+   "- The input snippets are separated by a line containing exactly \"---\"\n"
+   "- You must output exactly the same number of snippets, "
+   "separated by lines containing exactly \"---\"\n"
+   "- Do NOT add numbers, bullets, quotes, or any introductory/concluding text\n"
+   "- Each output snippet must be ONLY the translated content\n\n"
+   "TRANSLATION RULES:\n"
+   "- Preserve all HTML tags as-is; only translate the text between tags\n"
+   "- Preserve: technical terms, proper nouns, brand names, URLs, emoji, code blocks\n"
+   "- If text is already in the target language, output it unchanged\n"
+   "- Translate the MEANING, not word-for-word; make it sound natural\n\n"
+   "EXAMPLE INPUT:\n"
+   "<p>OpenAI has announced the release of GPT-5.</p>\n"
+   "---\n"
+   "<p>This tutorial covers building REST APIs with Flask.</p>\n\n"
+   "EXAMPLE OUTPUT:\n"
+   "<p>OpenAI 已发布 GPT-5 模型。</p>\n"
+   "---\n"
+   "<p>本教程介绍如何使用 Flask 构建 REST API。</p>")
+  "System prompt template for content translation.
+Used when feeds are tagged with `elfeed-translate-content-tag'.
+Each content snippet is treated as an independent translation unit,
+separated by \"---\".  %s is replaced with
+`elfeed-translate-target-lang'."
   :type 'string
   :group 'elfeed-translate)
 
@@ -172,6 +229,22 @@ requests to keep each batch manageable for the model."
   :type 'integer
   :group 'elfeed-translate)
 
+(defcustom elfeed-translate-content-batch-size 5
+  "Maximum number of content snippets sent in a single API request.
+Content is typically much longer than titles, so this should be
+smaller than `elfeed-translate-batch-size'."
+  :type 'integer
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-content-max-chars 500
+  "Maximum number of characters of entry content to translate.
+Content longer than this is truncated to save tokens.  The
+truncation keeps the first N characters, which usually covers the
+opening paragraph(s) — enough to preview the article without
+opening it."
+  :type 'integer
+  :group 'elfeed-translate)
+
 (defcustom elfeed-translate-parallel nil
   "When non-nil, dispatch translation batches concurrently.
 Parallel mode keeps at most `elfeed-translate-max-concurrent' API
@@ -184,8 +257,7 @@ before sending, which is safer for slow or rate-limited endpoints."
 
 (defcustom elfeed-translate-max-concurrent 4
   "Maximum number of API requests in flight simultaneously.
-Used only in parallel mode.  Each batch is still capped at
-`elfeed-translate-batch-size' titles.  Has no effect when
+Used only in parallel mode.  Has no effect when
 `elfeed-translate-parallel' is nil."
   :type 'integer
   :group 'elfeed-translate)
@@ -200,12 +272,15 @@ connection from blocking translation indefinitely.  Set to nil or
                  (integer :tag "Seconds"))
   :group 'elfeed-translate)
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Translation Cache
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defvar elfeed-translate--cache (make-hash-table :test 'equal)
-  "Hash table mapping original title   translated title.")
+  "Hash table mapping MD5 hash keys to translated strings.
+The key is the MD5 of the source text (title or content snippet),
+ensuring a flat key→value structure that maps cleanly to a future
+SQLite table (translations(key TEXT PRIMARY KEY, value TEXT)).")
 
 (defvar elfeed-translate--cache-dirty nil
   "Non-nil when the cache has unsaved modifications.")
@@ -245,19 +320,24 @@ connection from blocking translation indefinitely.  Set to nil or
         (write-region (point-min) (point-max) file nil 'silent))
       (setq elfeed-translate--cache-dirty nil))))
 
-(defun elfeed-translate--cache-get (title)
-  "Return the cached translation for TITLE, or nil."
-  (gethash title elfeed-translate--cache))
+(defun elfeed-translate--cache-key (text)
+  "Return the MD5 hash of TEXT for use as a cache key."
+  (secure-hash 'md5 text))
 
-(defun elfeed-translate--cache-set (title translation)
-  "Store TRANSLATION as the cached version of TITLE."
-  (unless (equal title translation)
-    (puthash title translation elfeed-translate--cache)
+(defun elfeed-translate--cache-get (text)
+  "Return the cached translation for TEXT, or nil.
+The cache key is the MD5 of TEXT."
+  (gethash (elfeed-translate--cache-key text) elfeed-translate--cache))
+
+(defun elfeed-translate--cache-set (key translation)
+  "Store TRANSLATION in the cache under KEY (an MD5 hash string)."
+  (unless (equal key translation)
+    (puthash key translation elfeed-translate--cache)
     (setq elfeed-translate--cache-dirty t)))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Utility Functions
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defun elfeed-translate--feed-hash (feed-url)
   "Return a short hex hash of FEED-URL.
@@ -280,11 +360,12 @@ Used for naming local RSS files and generating unique entry GUIDs."
 Always produces English weekday/month abbreviations regardless of the
 system locale or `system-time-locale', because some locales (e.g.
 Chinese) cause `format-time-string' to emit non-standard names like
-\"  \" / \"6 \" that Elfeed cannot parse."
-  (if (and timestamp (> timestamp 0))
-      (format-time-string "%a, %d %b %Y %H:%M:%S %z"
-                          (seconds-to-time timestamp))
-    (format-time-string "%a, %d %b %Y %H:%M:%S %z")))
+\"周二\" / \"6月\" that Elfeed cannot parse."
+  (let ((system-time-locale "C"))
+    (if (and timestamp (> timestamp 0))
+        (format-time-string "%a, %d %b %Y %H:%M:%S %z"
+                            (seconds-to-time timestamp))
+      (format-time-string "%a, %d %b %Y %H:%M:%S %z"))))
 
 (defun elfeed-translate--entry-guid (feed-url entry)
   "Build a unique GUID for ENTRY in the translated RSS file of FEED-URL.
@@ -300,19 +381,42 @@ Returns nil for feeds without autotags.  Works with both plain
 URL entries and (URL . TAGS) cons entries."
   (elfeed-feed-autotags feed-url))
 
-(defun elfeed-translate--feed-has-tag-p (feed-url)
+(defun elfeed-translate--feed-has-title-tag-p (feed-url)
   "Return non-nil if FEED-URL has `elfeed-translate-feed-tag' in its autotags."
   (memq elfeed-translate-feed-tag
         (elfeed-translate--feed-autotags feed-url)))
 
+(defun elfeed-translate--feed-has-content-tag-p (feed-url)
+  "Return non-nil if FEED-URL has `elfeed-translate-content-tag' in its autotags."
+  (memq elfeed-translate-content-tag
+        (elfeed-translate--feed-autotags feed-url)))
+
+(defun elfeed-translate--entry-content (entry)
+  "Return the content string of ENTRY, or nil if it has no content.
+Handles both string content and `elfeed-ref' objects (the latter
+are dereferenced via `elfeed-deref').  The content is truncated to
+`elfeed-translate-content-max-chars' characters."
+  (let ((content (elfeed-entry-content entry)))
+    (when content
+      (let ((text
+             (cond
+              ((stringp content) content)
+              ((elfeed-ref-p content) (elfeed-deref content))
+              (t nil))))
+        (when (and text (not (string-empty-p text)))
+          (if (> (length text) elfeed-translate-content-max-chars)
+              (substring text 0 elfeed-translate-content-max-chars)
+            text))))))
+
 (defun elfeed-translate--translatable-feeds ()
   "Return a list of all feed URLs that should be translated.
-A feed is translatable if it has `elfeed-translate-feed-tag' as
-an autotag in `elfeed-feeds'."
+A feed is translatable if it has `elfeed-translate-feed-tag'
+or `elfeed-translate-content-tag' as an autotag in `elfeed-feeds'."
   (let ((feeds '()))
     (dolist (f elfeed-feeds)
       (let ((url (if (consp f) (car f) f)))
-        (when (elfeed-translate--feed-has-tag-p url)
+        (when (or (elfeed-translate--feed-has-title-tag-p url)
+                  (elfeed-translate--feed-has-content-tag-p url))
           (push url feeds))))
     (nreverse feeds)))
 
@@ -328,9 +432,9 @@ an autotag in `elfeed-feeds'."
           (lambda (a b)
             (> (elfeed-entry-date a) (elfeed-entry-date b))))))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; RSS XML Generation
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defun elfeed-translate--format-title (original translated)
   "Format a translated title according to `elfeed-translate-title-style'.
@@ -345,21 +449,30 @@ translated title.  The separator is taken from
 
 (defun elfeed-translate--generate-rss (feed-url)
   "Generate a local RSS 2.0 XML file for FEED-URL.
-Includes only entries that have a cached translation.  Returns the
-path to the generated file."
+Includes only entries that have at least one cached translation
+(title or content).  Returns the path to the generated file."
   (let* ((feed (elfeed-db-get-feed feed-url))
          (feed-title (if feed
                          (or (elfeed-feed-title feed) feed-url)
                        feed-url))
-         (translated-title (concat elfeed-translate-feed-title-prefix
-                                   feed-title))
+         (translated-feed-title (concat elfeed-translate-feed-title-prefix
+                                        feed-title))
+         (has-title-tag (elfeed-translate--feed-has-title-tag-p feed-url))
+         (has-content-tag (elfeed-translate--feed-has-content-tag-p feed-url))
          (entries (elfeed-translate--entries-for-feed feed-url))
          (translated-entries
           (seq-filter
            (lambda (e)
-             (and (elfeed-entry-title e)
-                  (not (string-empty-p (elfeed-entry-title e)))
-                  (elfeed-translate--cache-get (elfeed-entry-title e))))
+             (let ((title (elfeed-entry-title e))
+                   (content (when has-content-tag
+                              (elfeed-translate--entry-content e))))
+               (or (and has-title-tag
+                        title
+                        (not (string-empty-p title))
+                        (elfeed-translate--cache-get title))
+                   (and has-content-tag
+                        content
+                        (elfeed-translate--cache-get content)))))
            entries))
          (file (elfeed-translate--local-feed-path feed-url)))
     (make-directory (file-name-directory file) t)
@@ -369,7 +482,7 @@ path to the generated file."
       (insert "  <channel>\n")
       ;; Channel metadata
       (insert (format "    <title>%s</title>\n"
-                      (xml-escape-string translated-title)))
+                      (xml-escape-string translated-feed-title)))
       (insert (format "    <link>%s</link>\n"
                       (xml-escape-string feed-url)))
       (insert (format "    <description>Auto-translated RSS feed for %s</description>\n"
@@ -379,9 +492,23 @@ path to the generated file."
       ;; Entries
       (dolist (entry translated-entries)
         (let* ((original-title (elfeed-entry-title entry))
-               (translated-title (elfeed-translate--cache-get original-title))
-               (display-title (elfeed-translate--format-title
-                               original-title translated-title))
+               (content (when has-content-tag
+                          (elfeed-translate--entry-content entry)))
+               (translated-title
+                (when (and has-title-tag original-title
+                           (not (string-empty-p original-title)))
+                  (elfeed-translate--cache-get original-title)))
+               (translated-content
+                (when (and has-content-tag content)
+                  (elfeed-translate--cache-get content)))
+               ;; Decide display title
+               (display-title
+                (cond
+                 ((and translated-title original-title)
+                  (elfeed-translate--format-title original-title translated-title))
+                 (translated-title translated-title)
+                 (original-title original-title)
+                 (t "")))
                (link (elfeed-entry-link entry))
                (guid (elfeed-translate--entry-guid feed-url entry))
                (date (elfeed-entry-date entry)))
@@ -394,15 +521,18 @@ path to the generated file."
                           (xml-escape-string guid)))
           (insert (format "      <pubDate>%s</pubDate>\n"
                           (elfeed-translate--rfc2822-date date)))
+          (when translated-content
+            (insert (format "      <description>%s</description>\n"
+                            (xml-escape-string translated-content))))
           (insert "    </item>\n")))
       (insert "  </channel>\n")
       (insert "</rss>\n")
       (write-region (point-min) (point-max) file nil 'silent))
     file))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; API Client
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defvar elfeed-translate--busy nil
   "Non-nil while a translation cycle is active.
@@ -411,21 +541,25 @@ In parallel mode it is held for the whole dispatch cycle and cleared
 once every batch has completed.  `elfeed-translate--on-db-update'
 checks this to avoid starting overlapping cycles.")
 
-(defun elfeed-translate--call-api (titles callback &optional no-busy-guard)
-  "Translate TITLES (list of strings) via the configured LLM API.
-CALLBACK receives one argument: an alist of (original . translated)
-pairs on success, or nil on failure.
+(defun elfeed-translate--call-api (texts callback &optional no-busy-guard system-prompt)
+  "Translate TEXTS (list of strings) via the configured LLM API.
+CALLBACK receives one argument: an alist of (cache-key . translated)
+pairs on success, or nil on failure.  cache-key is the MD5 of each
+input string.
 
-The titles are sent as a single batch, separated by '---' markers.
-The API response is expected to contain translated titles separated
+The texts are sent as a single batch, separated by '---' markers.
+The API response is expected to contain translated texts separated
 by the same marker.
+
+SYSTEM-PROMPT is the prompt template (with %s for target language).
+Defaults to `elfeed-translate-system-prompt'.
 
 When NO-BUSY-GUARD is non-nil, neither check nor touch
 `elfeed-translate--busy'.  Used by parallel dispatch
 \(`elfeed-translate--process-batches-parallel') which manages the lock
 at the cycle level and allows several requests in flight at once.
 
-Always uses `url-retrieve' directly   never `url-queue-retrieve',
+Always uses `url-retrieve' directly — never `url-queue-retrieve',
 which defers the actual request to an idle timer and loses the
 dynamic `url-request-method' / `url-request-extra-headers' /
 `url-request-data' bindings."
@@ -436,17 +570,21 @@ dynamic `url-request-method' / `url-request-extra-headers' /
    ((null elfeed-translate-api-key)
     (message "[elfeed-translate] API key is not configured")
     (when callback (funcall callback nil)))
-   ((null titles)
+   ((null texts)
     (when callback (funcall callback nil)))
    (t
     (unless no-busy-guard (setq elfeed-translate--busy t))
-    (let* ((system-prompt (format elfeed-translate-system-prompt
-                                  elfeed-translate-target-lang))
-           (user-content (string-join titles "\n---\n"))
+    (let* ((prompt-template (or system-prompt
+                                elfeed-translate-system-prompt))
+           (system-prompt-str (format prompt-template
+                                      elfeed-translate-target-lang))
+           (user-content (string-join texts "\n---\n"))
+           ;; Pre-compute cache keys (MD5 of each input text)
+           (keys (mapcar #'elfeed-translate--cache-key texts))
            (request-body
             `((model . ,elfeed-translate-model)
               (messages . [((role . "system")
-                            (content . ,system-prompt))
+                            (content . ,system-prompt-str))
                            ((role . "user")
                             (content . ,user-content))])
               (temperature . ,elfeed-translate-temperature)))
@@ -459,13 +597,13 @@ dynamic `url-request-method' / `url-request-extra-headers' /
         (message "[elfeed-translate] Sending API request:
   URL   : %s
   Model : %s
-  Titles: %d
+  Items : %d
   First : %s"
                  elfeed-translate-api-url
                  elfeed-translate-model
-                 (length titles)
-                 (if titles
-                     (substring (car titles) 0 (min 80 (length (car titles))))
+                 (length texts)
+                 (if texts
+                     (substring (car texts) 0 (min 80 (length (car texts))))
                    "N/A")))
       (condition-case err
           (let ((done nil)
@@ -504,7 +642,7 @@ dynamic `url-request-method' / `url-request-extra-headers' /
                ;; its process if it fires before we finish.
                (setq response-buffer (current-buffer))
                (if done
-                   ;; Watchdog already fired   discard this late response.
+                   ;; Watchdog already fired — discard this late response.
                    (progn
                      (when timeout-timer
                        (cancel-timer timeout-timer)
@@ -513,13 +651,13 @@ dynamic `url-request-method' / `url-request-extra-headers' /
                      (let ((result
                             (condition-case parse-err
                                 (elfeed-translate--parse-response
-                                 titles (current-buffer))
+                                 keys (current-buffer))
                               (error
                                (message
                                 "[elfeed-translate] Parse error: %s"
                                 (error-message-string parse-err))
                                (elfeed-translate--dump-failed-response
-                                (current-buffer) titles
+                                (current-buffer) keys
                                 (format "parse error: %s"
                                         (error-message-string parse-err)))
                                nil))))
@@ -573,7 +711,7 @@ Returns the body as a trimmed string."
                          (concat (substring body 0 500) "...")
                        body)))
           (string-trim body))
-      ;; No header/body separator found   return everything
+      ;; No header/body separator found — return everything
       (let ((body (buffer-substring (point-min) (point-max))))
         (message "[elfeed-translate] No header separator found, raw body: %s"
                  (if (> (length body) 200)
@@ -588,29 +726,56 @@ Returns the body as a trimmed string."
     (when (re-search-forward "HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
       (string-to-number (match-string 1)))))
 
-(defun elfeed-translate--parse-response (titles buffer)
-  "Parse the API response in BUFFER and pair with TITLES.
-Returns an alist of (original . translated) or nil on failure.
-Uses catch/throw for early exit instead of cl-return-from to avoid
-issues with condition-case unwinding."
+(defun elfeed-translate--dump-failed-response (buffer keys reason)
+  "Write the full raw content of BUFFER to a debug buffer for inspection.
+KEYS is the list of cache keys sent in the failed request.  REASON is a
+short string describing the failure (e.g. \"HTTP 404\", \"empty body\",
+\"parse error\").  The debug buffer `*elfeed-translate-debug*' is
+created or appended to, with a separator line between entries."
+  (let ((raw (if (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (buffer-substring-no-properties (point-min) (point-max)))
+               "<buffer killed>")))
+    (with-current-buffer (get-buffer-create "*elfeed-translate-debug*")
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format "\n════════ FAILED RESPONSE: %s ════════\n" reason))
+        (insert (format "Timestamp : %s\n"
+                        (let ((system-time-locale "C"))
+                          (format-time-string "%Y-%m-%d %H:%M:%S")))
+                (insert (format "Keys      : %d\n" (length keys)))
+                (insert (format "Buffer    : %S (%d bytes)\n"
+                                (buffer-name buffer) (length raw)))
+                (insert "─── raw response start ───\n")
+                (insert raw)
+                (insert "\n─── raw response end ───\n")))
+    (message "[elfeed-translate] Failed response dumped to *elfeed-translate-debug* (%s)"
+             reason))))
+
+(defun elfeed-translate--parse-response (keys buffer)
+  "Parse the API response in BUFFER and pair with KEYS.
+KEYS is a list of MD5 cache-key strings in the same order as the
+texts sent.  Returns an alist of (key . translated) or nil on
+failure.  Uses catch/throw for early exit instead of cl-return-from
+to avoid issues with condition-case unwinding."
   (catch 'parse-error
-    ;; Early exit on HTTP errors   the body is likely an HTML error
+    ;; Early exit on HTTP errors — the body is likely an HTML error
     ;; page, not JSON, so skip json-parse-string to avoid confusing
     ;; parse-error messages.
     (let ((http-status (elfeed-translate--http-status buffer)))
       (when (and http-status (>= http-status 400))
-        (message "[elfeed-translate] HTTP %d   skipping JSON parse" http-status)
+        (message "[elfeed-translate] HTTP %d — skipping JSON parse" http-status)
         (elfeed-translate--dump-failed-response
-         buffer titles (format "HTTP %d" http-status))
+         buffer keys (format "HTTP %d" http-status))
         (throw 'parse-error nil)))
     (let ((response-text (elfeed-translate--extract-body buffer)))
       (unless response-text
         (message "[elfeed-translate] Empty response body")
-        (elfeed-translate--dump-failed-response buffer titles "empty body")
+        (elfeed-translate--dump-failed-response buffer keys "empty body")
         (throw 'parse-error nil))
       (when (string-empty-p response-text)
         (message "[elfeed-translate] Empty response body")
-        (elfeed-translate--dump-failed-response buffer titles "empty body string")
+        (elfeed-translate--dump-failed-response buffer keys "empty body string")
         (throw 'parse-error nil))
 
       ;; Parse JSON.  We pass :object-type / :array-type as keyword
@@ -638,8 +803,8 @@ issues with condition-case unwinding."
                     (message "[elfeed-translate] JSON parse error: %s"
                              (error-message-string json-err))
                     (elfeed-translate--dump-failed-response
-                     buffer titles (format "JSON parse: %s"
-                                           (error-message-string json-err)))
+                     buffer keys (format "JSON parse: %s"
+                                         (error-message-string json-err)))
                     (throw 'parse-error nil)))))))
         (when elfeed-translate-debug
           (message "[elfeed-translate] Parsed JSON keys: %s"
@@ -658,47 +823,64 @@ issues with condition-case unwinding."
              (if choices "present" "missing")
              (if message-obj (mapcar #'car message-obj) "missing"))
             (elfeed-translate--dump-failed-response
-             buffer titles "unexpected API structure")
+             buffer keys "unexpected API structure")
             (throw 'parse-error nil))
 
           ;; Split the translated content by the batch separator
           (let ((translated (split-string content "---" t "[ \t\n\r]+")))
-            (if (= (length translated) (length titles))
-                (cl-mapcar #'cons titles translated)
+            (if (= (length translated) (length keys))
+                (cl-mapcar #'cons keys translated)
               (message
-               (concat "[elfeed-translate] Title count mismatch: "
+               (concat "[elfeed-translate] Count mismatch: "
                        "expected %d, got %d (%s). "
                        "Falling back to line-by-line parsing.")
-               (length titles) (length translated)
+               (length keys) (length translated)
                (mapconcat #'identity translated " | "))
               ;; Fallback: split by newlines
               (let ((lines (split-string content "\n" t "\\s-*")))
-                (if (= (length lines) (length titles))
-                    (cl-mapcar #'cons titles lines)
+                (if (= (length lines) (length keys))
+                    (cl-mapcar #'cons keys lines)
                   (message "[elfeed-translate] Line count still mismatched: %d vs %d"
-                           (length titles) (length lines))
+                           (length keys) (length lines))
                   nil)))))))))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Core Translation Logic
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defun elfeed-translate--collect-untranslated ()
-  "Scan all feeds marked with `elfeed-translate-feed-tag' for untranslated titles.
-Returns an alist of (feed-url . title) for titles needing translation."
-  (let ((items '()))
+  "Scan all translatable feeds for untranslated titles and content.
+Returns a plist with two lists:
+  :title-items   — list of (feed-url . title) for title translation
+  :content-items — list of (feed-url . content) for content translation
+Title and content are collected independently: a feed with only
+`translate_title' contributes to :title-items, a feed with only
+`translate_content' contributes to :content-items, and a feed with
+both contributes to both."
+  (let ((title-items '())
+        (content-items '()))
     (dolist (feed-url (elfeed-translate--translatable-feeds))
-      (dolist (entry (elfeed-translate--entries-for-feed feed-url))
-        (let ((title (elfeed-entry-title entry)))
-          (when (and title
-                     (not (string-empty-p title))
-                     (not (elfeed-translate--cache-get title)))
-            (push (cons feed-url title) items)))))
-    (nreverse items)))
+      (let ((has-title (elfeed-translate--feed-has-title-tag-p feed-url))
+            (has-content (elfeed-translate--feed-has-content-tag-p feed-url)))
+        (dolist (entry (elfeed-translate--entries-for-feed feed-url))
+          (when has-title
+            (let ((title (elfeed-entry-title entry)))
+              (when (and title
+                         (not (string-empty-p title))
+                         (not (elfeed-translate--cache-get title)))
+                (push (cons feed-url title) title-items))))
+          (when has-content
+            (let ((content (elfeed-translate--entry-content entry)))
+              (when (and content
+                         (not (string-empty-p content))
+                         (not (elfeed-translate--cache-get content)))
+                (push (cons feed-url content) content-items)))))))
+    (list :title-items (nreverse title-items)
+          :content-items (nreverse content-items))))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Feed List Display
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defun elfeed-translate--insert-org-format (feeds)
   "Insert translated feed URLs in elfeed-org compatible format.
@@ -754,8 +936,9 @@ file:// URLs point to up-to-date content."
   (interactive)
   (let ((feeds (elfeed-translate--translatable-feeds)))
     (unless feeds
-      (user-error "No feeds tagged with `%s' in `elfeed-feeds'"
-                  elfeed-translate-feed-tag))
+      (user-error "No feeds tagged with `%s' or `%s' in `elfeed-feeds'"
+                  elfeed-translate-feed-tag
+                  elfeed-translate-content-tag))
     ;; Regenerate all RSS files first
     (dolist (feed-url feeds)
       (elfeed-translate--generate-rss feed-url))
@@ -775,17 +958,17 @@ file:// URLs point to up-to-date content."
                   (org-fold-hide-drawers-all)   ; org 9.6+
                 (error
                  (condition-case nil
-                     (org-cycle-hide-drawers 'all) ; org 9.0 9.5
+                     (org-cycle-hide-drawers 'all) ; org 9.0–9.5
                    (error nil)))))
           (emacs-lisp-mode))
         (read-only-mode 1))
       (pop-to-buffer buf)
-      (message "[elfeed-translate] %d feed URL(s) shown   copy into your feed configuration"
+      (message "[elfeed-translate] %d feed URL(s) shown — copy into your feed configuration"
                (length feeds)))))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; DB Update Handler
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defun elfeed-translate--split-into-batches (list batch-size)
   "Split LIST into sublists of at most BATCH-SIZE elements."
@@ -797,55 +980,57 @@ file:// URLs point to up-to-date content."
         (setq remaining (nthcdr batch-size remaining))))
     (nreverse batches)))
 
-(defun elfeed-translate--finalize (title->feeds)
+(defun elfeed-translate--finalize (affected-feeds)
   "After all batches complete: regenerate RSS files.
-TITLE->FEEDS maps original titles to their source feed-urls.
-
-Only regenerates the local XML files   it does NOT call
+AFFECTED-FEEDS is a list of feed URLs whose entries were translated.
+Only regenerates the local XML files — it does NOT call
 `elfeed-update-feed'.  The user's next `elfeed-update' (or
 scheduled update) will pick up the new content naturally."
-  (let ((affected-feeds '()))
-    (maphash (lambda (_title feeds)
-               (dolist (f feeds)
-                 (cl-pushnew f affected-feeds :test #'equal)))
-             title->feeds)
-    (dolist (feed-url affected-feeds)
-      (elfeed-translate--generate-rss feed-url))
-    (message "[elfeed-translate] All batches complete   %d feed(s) updated"
-             (length affected-feeds))))
+  (dolist (feed-url affected-feeds)
+    (elfeed-translate--generate-rss feed-url))
+  (message "[elfeed-translate] All batches complete — %d feed(s) updated"
+           (length affected-feeds)))
 
-(defun elfeed-translate--process-batches (batches title->feeds total-batches)
-  "Process BATCHES sequentially, one API call per batch.
-TITLE->FEEDS maps titles   feed-urls.  TOTAL-BATCHES is the initial
-number of batches (for progress reporting)."
-  (when batches
-    (let ((batch (car batches))
-          (remaining (cdr batches))
-          (batch-num (1+ (- total-batches (length batches)))))
-      (message "[elfeed-translate] Batch %d/%d: translating %d titles..."
-               batch-num total-batches (length batch))
-      (elfeed-translate--call-api
-       batch
+(defun elfeed-translate--process-batches (queue affected-feeds)
+  "Process QUEUE sequentially, one API call per batch.
+QUEUE is a list of cons cells (call-fn . data) where call-fn is a
+function that accepts (texts callback no-busy-guard system-prompt)
+and data is (texts . system-prompt).
+AFFECTED-FEEDS is a list of feed URLs to regenerate on completion."
+  (when queue
+    (let* ((element (car queue))
+           (remaining (cdr queue))
+           (call-fn (car element))
+           (texts (cadr element))
+           (prompt (cddr element))
+           (total (length queue))
+           (batch-num (- total (length queue) -1)))
+      (message "[elfeed-translate] Batch %d/%d: translating %d items..."
+               batch-num total (length texts))
+      (funcall
+       call-fn
+       texts
        (lambda (pairs)
          (if pairs
              (progn
                (dolist (pair pairs)
                  (elfeed-translate--cache-set (car pair) (cdr pair)))
                (message "[elfeed-translate] Batch %d/%d: %d ok"
-                        batch-num total-batches (length pairs)))
+                        batch-num total (length pairs)))
            (message "[elfeed-translate] Batch %d/%d: FAILED"
-                    batch-num total-batches))
+                    batch-num total))
          (if remaining
              (elfeed-translate--process-batches
-              remaining title->feeds total-batches)
-           ;; All batches done   persist and refresh
+              remaining affected-feeds)
            (elfeed-translate--save-cache)
-           (elfeed-translate--finalize title->feeds)))))))
+           (elfeed-translate--finalize affected-feeds)))
+       nil  ; no-busy-guard
+       prompt))))
 
 (defvar elfeed-translate--parallel-state nil
   "Plist holding parallel-dispatch state between async callbacks.
 Keys: :queue, :in-flight, :completed, :total, :max-concurrent,
-:finalize-fn, :title->feeds.  Bound by
+:finalize-fn, :affected-feeds.  Bound by
 `elfeed-translate--process-batches-parallel' and read by
 `elfeed-translate--parallel-dispatch' and
 `elfeed-translate--parallel-callback'.")
@@ -879,96 +1064,120 @@ dispatches the next pending batch(es) and finalises when done."
 
 (defun elfeed-translate--parallel-dispatch ()
   "Dispatch pending batches up to the concurrency limit.
-Reads `elfeed-translate--parallel-state' and sends batches via
-`elfeed-translate--call-api' with `elfeed-translate--parallel-callback'
-as the completion callback."
+Reads `elfeed-translate--parallel-state'.  Each queue element is a
+cons cell (call-fn . (texts . prompt))."
   (let* ((state elfeed-translate--parallel-state)
          (queue (plist-get state :queue))
          (in-flight (plist-get state :in-flight))
          (max-concurrent (plist-get state :max-concurrent)))
     (while (and queue (< in-flight max-concurrent))
-      (let ((batch (pop queue)))
+      (let* ((element (pop queue))
+             (call-fn (car element))
+             (data (cdr element))
+             (texts (car data))
+             (prompt (cdr data)))
         (plist-put state :queue queue)
         (plist-put state :in-flight (1+ in-flight))
         (setq in-flight (1+ in-flight))
         (message
-         "[elfeed-translate] Dispatching batch (%d titles)... (%d pending)"
-         (length batch) (length queue))
-        (elfeed-translate--call-api
-         batch #'elfeed-translate--parallel-callback t)))))
+         "[elfeed-translate] Dispatching batch (%d items)... (%d pending)"
+         (length texts) (length queue))
+        (funcall call-fn
+                 texts #'elfeed-translate--parallel-callback t prompt)))))
 
-(defun elfeed-translate--process-batches-parallel (batches title->feeds total-batches)
-  "Process BATCHES concurrently with a self-managed concurrency limiter.
+(defun elfeed-translate--process-batches-parallel (queue affected-feeds)
+  "Process a QUEUE of batches concurrently with a self-managed limiter.
+QUEUE is a list of cons cells (call-fn . (texts . prompt)).
 At most `elfeed-translate-max-concurrent' API requests are in flight
-at once.  Each batch is still capped at `elfeed-translate-batch-size'
-titles.  The cache is saved and affected RSS files regenerated once
+at once.  The cache is saved and affected RSS files regenerated once
 every batch has completed.
 
-TITLE->FEEDS maps titles   feed-urls (used by `elfeed-translate--finalize').
-TOTAL-BATCHES is the total number of batches (for progress reporting).
-
-Unlike `elfeed-translate--process-batches', this function does not
-wait for a batch's response before sending the next; `--busy' is held
-for the whole cycle and cleared on completion.
+AFFECTED-FEEDS is a list of feed URLs to regenerate on completion.
 
 State is kept in `elfeed-translate--parallel-state' (a plist) rather
 than in `let*' closures, because the Emacs Lisp interpreter does not
 reliably capture `let*'-bound variables inside lambdas that are
 invoked from process filters (async callbacks)."
-  (if (null batches)
+  (if (null queue)
       (message "[elfeed-translate] No batches to process")
     (setq elfeed-translate--parallel-state
-          (list :queue (copy-sequence batches)
+          (list :queue (copy-sequence queue)
                 :in-flight 0
                 :completed 0
-                :total total-batches
+                :total (length queue)
                 :max-concurrent (max 1 elfeed-translate-max-concurrent)
-                :title->feeds title->feeds
+                :affected-feeds affected-feeds
                 :finalize-fn
                 (lambda ()
                   (elfeed-translate--save-cache)
-                  (elfeed-translate--finalize title->feeds)
+                  (elfeed-translate--finalize affected-feeds)
                   (setq elfeed-translate--busy nil)
                   (setq elfeed-translate--parallel-state nil))))
     (setq elfeed-translate--busy t)
     (elfeed-translate--parallel-dispatch)))
 
 (defun elfeed-translate--on-db-update ()
-  "Handle `elfeed-db-update-hook': translate new titles, update RSS files.
-Splits large title sets into batches (see `elfeed-translate-batch-size')
-and processes them via async API calls, either sequentially or in
-parallel depending on `elfeed-translate-parallel'."
+  "Handle `elfeed-db-update-hook': translate new entries, update RSS files.
+Collects untranslated titles and content independently, splits each
+into batches using the appropriate batch size, and processes them
+via async API calls — either sequentially or in parallel depending
+on `elfeed-translate-parallel'.
+
+Title batches use `elfeed-translate-system-prompt' and
+`elfeed-translate-batch-size'.  Content batches use
+`elfeed-translate-content-system-prompt' and
+`elfeed-translate-content-batch-size'.  Both are merged into a
+single queue (title batches first, content batches second) and
+processed as one cycle."
   (when (and (not elfeed-translate--busy)
              (elfeed-translate--translatable-feeds))
-    (let ((items (elfeed-translate--collect-untranslated)))
-      (if (not items)
+    (let* ((collected (elfeed-translate--collect-untranslated))
+           (title-items (plist-get collected :title-items))
+           (content-items (plist-get collected :content-items)))
+      (if (and (null title-items) (null content-items))
           (progn
-            (message "[elfeed-translate] All titles up to date   regenerating RSS files")
+            (message "[elfeed-translate] All content up to date — regenerating RSS files")
             (dolist (feed-url (elfeed-translate--translatable-feeds))
               (elfeed-translate--generate-rss feed-url)))
-        (let* ((titles (delete-dups (mapcar #'cdr items)))
-               ;; Build reverse index: title   list of feed-urls
-               (title->feeds (make-hash-table :test 'equal))
-               (batches (elfeed-translate--split-into-batches
-                         titles elfeed-translate-batch-size)))
-          (dolist (item items)
-            (let ((feed-url (car item))
-                  (title (cdr item)))
-              (cl-pushnew feed-url (gethash title title->feeds)
-                          :test #'equal)))
-          (message "[elfeed-translate] %d titles in %d batch(es) across %d feed(s)"
-                   (length titles)
-                   (length batches)
-                   (length (delete-dups (mapcar #'car items))))
-          (if elfeed-translate-parallel
-              (elfeed-translate--process-batches-parallel
-               batches title->feeds (length batches))
-            (elfeed-translate--process-batches
-             batches title->feeds (length batches))))))))
+        (let* (;; Deduplicated titles for title batches
+               (titles (delete-dups (mapcar #'cdr title-items)))
+               ;; Deduplicated content snippets for content batches
+               (contents (delete-dups (mapcar #'cdr content-items)))
+               ;; Collect all affected feed URLs
+               (affected-feeds
+                (delete-dups
+                 (append (mapcar #'car title-items)
+                         (mapcar #'car content-items)))))
+          ;; Build unified queue: (call-fn . (texts . prompt)) cons cells
+          (let* ((title-batches
+                  (mapcar (lambda (batch)
+                            (cons #'elfeed-translate--call-api
+                                  (cons batch
+                                        elfeed-translate-system-prompt)))
+                          (elfeed-translate--split-into-batches
+                           titles elfeed-translate-batch-size)))
+                 (content-batches
+                  (mapcar (lambda (batch)
+                            (cons #'elfeed-translate--call-api
+                                  (cons batch
+                                        elfeed-translate-content-system-prompt)))
+                          (elfeed-translate--split-into-batches
+                           contents elfeed-translate-content-batch-size)))
+                 (queue (append title-batches content-batches)))
+            (message
+             "[elfeed-translate] %d titles (%d batch(es)) + %d content (%d batch(es)) across %d feed(s)"
+             (length titles) (length title-batches)
+             (length contents) (length content-batches)
+             (length affected-feeds))
+            (if elfeed-translate-parallel
+                (elfeed-translate--process-batches-parallel
+                 queue affected-feeds)
+              (elfeed-translate--process-batches
+               queue affected-feeds))))))))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Public Commands
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 (defvar elfeed-translate--setup-done nil
   "Non-nil after the one-time portion of `elfeed-translate-setup' has run.")
@@ -979,7 +1188,7 @@ parallel depending on `elfeed-translate-parallel'."
 Creates output directory, loads the translation cache, generates
 initial RSS files, and installs the update hook.
 
-This function is idempotent   the heavy one-time work (directory
+This function is idempotent — the heavy one-time work (directory
 creation, cache load, RSS generation) only runs on the first call.
 Subsequent calls merely ensure `elfeed-db-update-hook' is in place.
 
@@ -994,8 +1203,9 @@ Hooked into `elfeed-search-mode-hook' so that opening Elfeed
   (unless (elfeed-translate--translatable-feeds)
     (display-warning
      'elfeed-translate
-     (format "No feeds tagged with `%s'.  Add the tag to feeds in `elfeed-feeds'."
-             elfeed-translate-feed-tag)
+     (format "No feeds tagged with `%s' or `%s'.  Add a tag to feeds in `elfeed-feeds'."
+             elfeed-translate-feed-tag
+             elfeed-translate-content-tag)
      :warning))
   ;; One-time initialisation
   (unless elfeed-translate--setup-done
@@ -1004,7 +1214,7 @@ Hooked into `elfeed-search-mode-hook' so that opening Elfeed
     (dolist (feed-url (elfeed-translate--translatable-feeds))
       (elfeed-translate--generate-rss feed-url))
     (setq elfeed-translate--setup-done t)
-    (message "[elfeed-translate] Setup   %d feed(s), %d cached translation(s)"
+    (message "[elfeed-translate] Setup — %d feed(s), %d cached translation(s)"
              (length (elfeed-translate--translatable-feeds))
              (hash-table-count elfeed-translate--cache))
     (unless (featurep 'elfeed-search)
@@ -1022,20 +1232,21 @@ Hooked into `elfeed-search-mode-hook' so that opening Elfeed
 
 ;;;###autoload
 (defun elfeed-translate-update ()
-  "Manually trigger translation of all tagged feed titles.
+  "Manually trigger translation of all tagged feed entries.
 Useful for re-translating after changing the target language or
 system prompt."
   (interactive)
   (unless (elfeed-translate--translatable-feeds)
-    (user-error "No feeds tagged with `%s' in `elfeed-feeds'"
-                elfeed-translate-feed-tag))
+    (user-error "No feeds tagged with `%s' or `%s' in `elfeed-feeds'"
+                elfeed-translate-feed-tag
+                elfeed-translate-content-tag))
   (message "[elfeed-translate] Starting manual translation...")
   (elfeed-translate--on-db-update))
 
 ;;;###autoload
 (defun elfeed-translate-clear-cache ()
   "Clear all cached translations and regenerate RSS files.
-Use this when you want to force a fresh translation of all titles
+Use this when you want to force a fresh translation of all content
 (with a new target language, for example)."
   (interactive)
   (when (yes-or-no-p "Clear all cached translations and re-translate everything? ")
@@ -1099,8 +1310,7 @@ calls, so it exercises the actual request construction code."
 ;;;###autoload
 (defun elfeed-translate-stats ()
   "Display translation statistics in the message area.
-Shows all feeds tagged with `elfeed-translate-feed-tag' and
-their translation status."
+Shows all translatable feeds and their translation status."
   (interactive)
   (let* ((feeds (elfeed-translate--translatable-feeds))
          (lines '())
@@ -1108,7 +1318,8 @@ their translation status."
          (total-entries 0)
          (total-untranslated 0))
     (push (format "elfeed-translate status:
-  Feed tag       : %s
+  Title tag      : %s
+  Content tag    : %s
   Target language: %s
   API endpoint   : %s
   Model          : %s
@@ -1116,6 +1327,7 @@ their translation status."
   Cached entries : %d
 "
                   elfeed-translate-feed-tag
+                  elfeed-translate-content-tag
                   elfeed-translate-target-lang
                   elfeed-translate-api-url
                   elfeed-translate-model
@@ -1123,26 +1335,40 @@ their translation status."
                   total-cached)
           lines)
     (if (not feeds)
-        (push (format "  (No feeds tagged with `%s' in `elfeed-feeds')\n"
-                      elfeed-translate-feed-tag)
+        (push (format "  (No feeds tagged with `%s' or `%s' in `elfeed-feeds')\n"
+                      elfeed-translate-feed-tag
+                      elfeed-translate-content-tag)
               lines)
       (dolist (feed-url feeds)
         (let* ((entries (elfeed-translate--entries-for-feed feed-url))
                (n-all (length entries))
+               (has-title (elfeed-translate--feed-has-title-tag-p feed-url))
+               (has-content (elfeed-translate--feed-has-content-tag-p feed-url))
                (n-cached
                 (seq-count
                  (lambda (e)
-                   (and (elfeed-entry-title e)
-                        (elfeed-translate--cache-get (elfeed-entry-title e))))
+                   (or (and has-title
+                            (elfeed-entry-title e)
+                            (not (string-empty-p (elfeed-entry-title e)))
+                            (elfeed-translate--cache-get (elfeed-entry-title e)))
+                       (and has-content
+                            (elfeed-translate--entry-content e)
+                            (elfeed-translate--cache-get
+                             (elfeed-translate--entry-content e)))))
                  entries))
-               (path (elfeed-translate--local-feed-path feed-url)))
+               (path (elfeed-translate--local-feed-path feed-url))
+               (tags-str (cond
+                          ((and has-title has-content) " [title+content]")
+                          (has-content " [content]")
+                          (t ""))))
           (cl-incf total-entries n-all)
           (cl-incf total-untranslated (- n-all n-cached))
-          (push (format "  %s
+          (push (format "  %s%s
       %d entries (%d translated, %d pending)
-        %s%s
+      → %s%s
 "
-                        feed-url n-all n-cached (- n-all n-cached)
+                        feed-url tags-str
+                        n-all n-cached (- n-all n-cached)
                         path
                         (if (file-exists-p path) "" " [MISSING]"))
                 lines))))
@@ -1152,29 +1378,29 @@ their translation status."
           lines)
     (message "%s" (string-join (nreverse lines)))))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Global Minor Mode
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 ;;;###autoload
 (define-minor-mode global-elfeed-translate-mode
-  "Toggle automatic translation of Elfeed entry titles.
-When enabled, titles of feeds tagged with `elfeed-translate-feed-tag'
-are automatically translated after each feed update via the
-configured LLM API."
+  "Toggle automatic translation of Elfeed entry titles and content.
+When enabled, entries of feeds tagged with `elfeed-translate-feed-tag'
+and/or `elfeed-translate-content-tag' are automatically translated
+after each feed update via the configured LLM API."
   :global t
   :lighter " ELTL"
   (if global-elfeed-translate-mode
       (elfeed-translate-setup)
     (elfeed-translate-teardown)))
 
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 ;; Auto-start hook: run setup whenever the Elfeed search buffer opens.
 ;; This mirrors how elfeed-org hooks into elfeed-search-mode-hook to
-;; load feeds   here we load the translation cache and enable the
+;; load feeds — here we load the translation cache and enable the
 ;; db-update-hook automatically.  The setup function is idempotent so
 ;; repeated calls are cheap.
-;;                                                                        
+;; ═══════════════════════════════════════════════════════════════════════
 
 ;;;###autoload
 (add-hook 'elfeed-search-mode-hook #'elfeed-translate-setup)
