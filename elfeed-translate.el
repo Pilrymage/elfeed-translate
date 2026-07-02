@@ -1085,98 +1085,109 @@ scheduled update) will pick up the new content naturally."
   (message "[elfeed-translate] All batches complete — %d feed(s) updated"
            (length affected-feeds)))
 
-(defun elfeed-translate--process-batch-with-retry
-    (call-fn texts prompt on-done batch-num total)
-  "Send TEXTS via CALL-FN with PROMPT, retrying on failure.
-ON-DONE is called with PAIRS (non-nil on success, nil on final
-failure) when the batch either succeeds or exhausts retries.
-BATCH-NUM and TOTAL are for progress messages."
-  (let ((retries 0)
-        (done nil))
-    (let ((send
-           (lambda ()
-             (funcall
-              call-fn
-              texts
-              (lambda (pairs)
-                (cond
-                 (done nil)  ; safety: ignore late response
-                 (pairs
-                  (elfeed-translate--cache-set-batch pairs)
-                  (message "[elfeed-translate] Batch %d/%d: %d ok"
-                           batch-num total (length pairs))
-                  (setq done t)
-                  (funcall on-done pairs))
-                 ((< retries elfeed-translate-max-retries)
-                  (cl-incf retries)
-                  (message
-                   "[elfeed-translate] Batch %d/%d: FAILED, retrying (%d/%d)..."
-                   batch-num total retries elfeed-translate-max-retries)
-                  (funcall send))
-                 (t
-                  (message
-                   "[elfeed-translate] Batch %d/%d: FAILED (retries exhausted)"
-                   batch-num total)
-                  (setq done t)
-                  (funcall on-done nil))))
-              nil  ; no-busy-guard
-              prompt))))
-      (funcall send))))
+(defvar elfeed-translate--serial-completed nil
+  "Counter for serial mode progress reporting.
+Tracks how many batches have completed (including retries exhausted)
+so that batch numbers stay consistent across retries.  Reset to nil
+when the cycle finishes.")
 
 (defun elfeed-translate--process-batches (queue affected-feeds)
   "Process QUEUE sequentially, one API call per batch.
-QUEUE is a list of cons cells (call-fn . (texts . prompt)).
+QUEUE is a list of plists: (:call-fn :texts :prompt :retries).
 AFFECTED-FEEDS is a list of feed URLs to regenerate on completion.
-Failed batches are retried up to `elfeed-translate-max-retries' times."
+Failed batches are re-enqueued with an incremented :retries counter,
+up to `elfeed-translate-max-retries' attempts."
   (when queue
     (let* ((element (car queue))
            (remaining (cdr queue))
-           (call-fn (car element))
-           (texts (car (cdr element)))
-           (prompt (cdr (cdr element)))
-           (total (length queue))
-           (batch-num (- total (length queue) -1)))
+           (call-fn (plist-get element :call-fn))
+           (texts (plist-get element :texts))
+           (prompt (plist-get element :prompt))
+           (retries (plist-get element :retries))
+           (done (or elfeed-translate--serial-completed 0))
+           (total (+ (length queue) done))
+           (batch-num (1+ done)))
       (message "[elfeed-translate] Batch %d/%d: translating %d items..."
                batch-num total (length texts))
-      (elfeed-translate--process-batch-with-retry
-       call-fn texts prompt
-       (lambda (_pairs)
+      (funcall
+       call-fn
+       texts
+       (lambda (pairs)
+         (if pairs
+             (progn
+               (elfeed-translate--cache-set-batch pairs)
+               (message "[elfeed-translate] Batch %d/%d: %d ok"
+                        batch-num total (length pairs))
+               (setq elfeed-translate--serial-completed
+                     (1+ (or elfeed-translate--serial-completed 0))))
+           ;; Failed — retry or give up
+           (if (< retries elfeed-translate-max-retries)
+               (progn
+                 (message
+                  "[elfeed-translate] Batch %d/%d: FAILED, will retry (%d/%d)..."
+                  batch-num total (1+ retries) elfeed-translate-max-retries)
+                 (setq remaining
+                       (append remaining
+                               (list (plist-put
+                                      (copy-sequence element)
+                                      :retries (1+ retries))))))
+             (message "[elfeed-translate] Batch %d/%d: FAILED (retries exhausted)"
+                      batch-num total)
+             (setq elfeed-translate--serial-completed
+                   (1+ (or elfeed-translate--serial-completed 0)))))
          (if remaining
              (elfeed-translate--process-batches remaining affected-feeds)
+           (setq elfeed-translate--serial-completed nil)
            (elfeed-translate--finalize affected-feeds)))
-       batch-num total))))
+       nil  ; no-busy-guard
+       prompt))))
 
 (defvar elfeed-translate--parallel-state nil
   "Plist holding parallel-dispatch state between async callbacks.
 Keys: :queue, :in-flight, :completed, :total, :max-concurrent,
-:finalize-fn, :affected-feeds.  Bound by
+:finalize-fn.  Queue elements are plists:
+(:call-fn :texts :prompt :retries).  Bound by
 `elfeed-translate--process-batches-parallel' and read by
 `elfeed-translate--parallel-dispatch' and
 `elfeed-translate--parallel-callback'.")
 
-(defun elfeed-translate--parallel-callback (pairs)
+(defun elfeed-translate--parallel-callback (element pairs)
   "Completion callback for one parallel API batch.
-Called by `elfeed-translate--process-batch-with-retry' after a
-batch succeeds (PAIRS non-nil) or exhausts retries (PAIRS nil).
-Reads and mutates `elfeed-translate--parallel-state'.  Decrements
-the in-flight counter, caches results if PAIRS is non-nil, then
-dispatches the next pending batch(es) and finalises when done."
+ELEMENT is the queue plist that was dispatched.  PAIRS is non-nil
+on success, nil on failure.  On success, caches results.  On
+failure with retries remaining, re-enqueues ELEMENT with
+incremented :retries.  Then dispatches next batches and finalises
+when the queue is drained and nothing is in flight."
   (let* ((state elfeed-translate--parallel-state)
          (completed (plist-get state :completed))
          (total (plist-get state :total))
-         (finalize-fn (plist-get state :finalize-fn)))
+         (finalize-fn (plist-get state :finalize-fn))
+         (retries (plist-get element :retries)))
     (unwind-protect
         (progn
           (plist-put state :in-flight (1- (plist-get state :in-flight)))
-          (plist-put state :completed (1+ completed))
           (if pairs
               (progn
                 (elfeed-translate--cache-set-batch pairs)
+                (plist-put state :completed (1+ completed))
                 (message
                  "[elfeed-translate] Batch completed: %d ok (%d/%d)"
                  (length pairs) (1+ completed) total))
-            (message "[elfeed-translate] Batch FAILED (%d/%d)"
-                     (1+ completed) total)))
+            ;; Failed — retry or give up
+            (if (< retries elfeed-translate-max-retries)
+                (progn
+                  (plist-put state :queue
+                             (append (plist-get state :queue)
+                                     (list (plist-put
+                                            (copy-sequence element)
+                                            :retries (1+ retries)))))
+                  (message
+                   "[elfeed-translate] Batch FAILED, will retry (%d/%d) (%d pending)"
+                   (1+ retries) elfeed-translate-max-retries
+                   (length (plist-get state :queue))))
+              (plist-put state :completed (1+ completed))
+              (message "[elfeed-translate] Batch FAILED (%d/%d)"
+                       (1+ completed) total))))
       (elfeed-translate--parallel-dispatch)
       (when (and (null (plist-get state :queue))
                  (= (plist-get state :in-flight) 0))
@@ -1184,41 +1195,42 @@ dispatches the next pending batch(es) and finalises when done."
 
 (defun elfeed-translate--parallel-dispatch ()
   "Dispatch pending batches up to the concurrency limit.
-Reads `elfeed-translate--parallel-state'.  Each queue element is a
-cons cell (call-fn . (texts . prompt)).  Uses
-`elfeed-translate--process-batch-with-retry' for retry logic,
-passing `elfeed-translate--parallel-callback' as the final
-on-success/failure callback."
+Reads `elfeed-translate--parallel-state'.  Queue elements are
+plists (:call-fn :texts :prompt :retries).  Calls
+`elfeed-translate--call-api' with `no-busy-guard' t and passes the
+element to `elfeed-translate--parallel-callback' via a closure."
   (let* ((state elfeed-translate--parallel-state)
          (queue (plist-get state :queue))
          (in-flight (plist-get state :in-flight))
          (max-concurrent (plist-get state :max-concurrent))
          (total (plist-get state :total)))
     (while (and queue (< in-flight max-concurrent))
-      (let* ((element (pop queue))
-             (call-fn (car element))
-             (data (cdr element))
-             (texts (car data))
-             (prompt (cdr data))
-             (batch-num (- total (length queue))))
+      (let* ((element (pop queue)))
         (plist-put state :queue queue)
         (plist-put state :in-flight (1+ in-flight))
         (setq in-flight (1+ in-flight))
-        (message
-         "[elfeed-translate] Dispatching batch %d/%d (%d items)... (%d pending)"
-         batch-num total (length texts) (length queue))
-        (elfeed-translate--process-batch-with-retry
-         call-fn texts prompt
-         (lambda (pairs) (elfeed-translate--parallel-callback pairs))
-         batch-num total)))))
+        (let ((call-fn (plist-get element :call-fn))
+              (texts (plist-get element :texts))
+              (prompt (plist-get element :prompt))
+              (retries (plist-get element :retries)))
+          (message
+           "[elfeed-translate] Dispatching batch (%d items, retries=%d)... (%d pending)"
+           (length texts) retries (length queue))
+          (funcall call-fn
+                   texts
+                   (lambda (pairs)
+                     (elfeed-translate--parallel-callback element pairs))
+                   t   ; no-busy-guard
+                   prompt))))))
 
 (defun elfeed-translate--process-batches-parallel (queue affected-feeds)
   "Process a QUEUE of batches concurrently with a self-managed limiter.
-QUEUE is a list of cons cells (call-fn . (texts . prompt)).
+QUEUE is a list of plists (:call-fn :texts :prompt :retries).
 At most `elfeed-translate-max-concurrent' API requests are in flight
-at once.  Translations are written to the SQLite cache in per-batch
-transactions, and affected RSS files are regenerated once every
-batch has completed.
+at once.  Failed batches are re-enqueued with incremented :retries,
+up to `elfeed-translate-max-retries'.  Translations are written to
+the SQLite cache in per-batch transactions, and affected RSS files
+are regenerated once every batch has completed.
 
 AFFECTED-FEEDS is a list of feed URLs to regenerate on completion.
 
@@ -1234,7 +1246,6 @@ invoked from process filters (async callbacks)."
                 :completed 0
                 :total (length queue)
                 :max-concurrent (max 1 elfeed-translate-max-concurrent)
-                :affected-feeds affected-feeds
                 :finalize-fn
                 (lambda ()
                   (elfeed-translate--finalize affected-feeds)
@@ -1275,19 +1286,21 @@ processed as one cycle."
                 (delete-dups
                  (append (mapcar #'car title-items)
                          (mapcar #'car content-items)))))
-          ;; Build unified queue: (call-fn . (texts . prompt)) cons cells
+          ;; Build unified queue: plists (:call-fn :texts :prompt :retries)
           (let* ((title-batches
                   (mapcar (lambda (batch)
-                            (cons #'elfeed-translate--call-api
-                                  (cons batch
-                                        elfeed-translate-system-prompt)))
+                            (list :call-fn #'elfeed-translate--call-api
+                                  :texts batch
+                                  :prompt elfeed-translate-system-prompt
+                                  :retries 0))
                           (elfeed-translate--split-into-batches
                            titles elfeed-translate-batch-size)))
                  (content-batches
                   (mapcar (lambda (batch)
-                            (cons #'elfeed-translate--call-api
-                                  (cons batch
-                                        elfeed-translate-content-system-prompt)))
+                            (list :call-fn #'elfeed-translate--call-api
+                                  :texts batch
+                                  :prompt elfeed-translate-content-system-prompt
+                                  :retries 0))
                           (elfeed-translate--split-into-batches
                            contents elfeed-translate-content-batch-size)))
                  (queue (append title-batches content-batches)))
