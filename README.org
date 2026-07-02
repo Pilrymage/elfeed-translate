@@ -185,6 +185,36 @@
   - Raw HTTP response body (first 500 characters)
   - Parsed JSON keys
   - Translation result (success/failure with pair count)
+  
+* FAQ
+- *How do I know if my API works?*
+  Try ~M-x elfeed-translate-test-api~, by which you call the provider with your API key.
+- *Elfeed doesn't display these translated titles.*
+  1. Check if the generated xml files are added into your ~elfeed.org~ collections.
+     After ~M-x elfeed~, using ~C-h v elfeed-feeds RET~ to find if local xml files appears in ~elfeed-feeds~ variable.
+  2. Check if your locale is ~en_US.UTF-8~, and fix this by adding: 
+     #+begin_src elisp
+       (set-locale-environment "en_US.UTF-8")
+     #+end_src
+     Since generated xml files contains ~pubDate~, which can be affected by system language used in Emacs.
+- *On choosing model*
+  + ~glm-4-flash-250414~ can be a free choice, but it suffers from heavily constraint of API usage;
+  + ~deepseek-v4-flash~ will be your best choice for this job, by paying little you get work done extremely fast (with official API providing concurrency).
+- *On serialize and concurrent*
+  + With a free and local model having slow connection, the default serialization model is fine;
+  + With ~deepseek-v4-flash~ and other cheapest model, have ~(elfeed-translate-parallel t)~ gives you multiple connection to provider site;
+    you may try ~(setq elfeed-translate-max-concurrent 16)~ for great acceleration on translation, especially on hundreds of batches.
+- *On my personal workflow*
+  1. Mark up feeds that need to be translated by adding ~translate_title~ tag..
+     It's fine for both elfeed config and ~elfeed.org~ format .
+  2. ~M-x elfeed~ to open elfeed.
+     if ~global-elfeed-translate-mode~ is ~t~, it will do ~elfeed-translate-setup~.
+  3. ~elfeed-translate-show-feeds~ to get all translated target subscriptions, in XML files.
+     You can paste them back into ~elfeed.org~. All translated subscriptions is hashed.
+  4. ~elfeed-update~ and makes elfeed fetch articles,
+     then ~elfeed-translate-update~ will be called automatically to translate these titles.
+  5. To get these translated titles, run ~elfeed-update~ to fetch them from XML files.
+     If translation works, you can apply ~-translate_title~ to filter out title not translated.
 
 * License
 
