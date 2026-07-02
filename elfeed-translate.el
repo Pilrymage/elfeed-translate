@@ -836,15 +836,15 @@ created or appended to, with a separator line between entries."
         (insert (format "\n════════ FAILED RESPONSE: %s ════════\n" reason))
         (insert (format "Timestamp : %s\n"
                         (let ((system-time-locale "C"))
-                          (format-time-string "%Y-%m-%d %H:%M:%S")))
-                (insert (format "Keys      : %d\n" (length keys)))
-                (insert (format "Buffer    : %S (%d bytes)\n"
-                                (buffer-name buffer) (length raw)))
-                (insert "─── raw response start ───\n")
-                (insert raw)
-                (insert "\n─── raw response end ───\n")))
+                          (format-time-string "%Y-%m-%d %H:%M:%S"))))
+        (insert (format "Keys      : %d\n" (length keys)))
+        (insert (format "Buffer    : %S (%d bytes)\n"
+                        (buffer-name buffer) (length raw)))
+        (insert "─── raw response start ───\n")
+        (insert raw)
+        (insert "\n─── raw response end ───\n")))
     (message "[elfeed-translate] Failed response dumped to *elfeed-translate-debug* (%s)"
-             reason))))
+             reason)))
 
 (defun elfeed-translate--parse-response (keys buffer)
   "Parse the API response in BUFFER and pair with KEYS.
