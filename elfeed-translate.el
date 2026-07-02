@@ -1,8 +1,8 @@
 ;;; elfeed-translate.el --- Translate Elfeed entry titles and content via LLM API -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.2.0
-;; Package-Requires: ((emacs "27.1") (elfeed "3.0"))
+;; Version: 0.3.0
+;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 ;; URL: https://github.com/pilrymage/elfeed-translate
 
@@ -18,9 +18,10 @@
 ;; only, or both.  Each uses its own system prompt and batch size.
 ;; Content is truncated to a configurable maximum before translation.
 ;;
-;; All translations are cached by the MD5 hash of the source text,
-;; making the cache flat (string key -> string value) and ready for
-;; future SQLite migration.
+;; All translations are cached in an SQLite database, keyed by the
+;; MD5 hash of the source text.  This provides crash-safe incremental
+;; writes, efficient lookups, and a schema ready for future features
+;; like article summarization.
 ;;
 ;; Usage:
 ;;   1. Tag the feeds you want translated in `elfeed-feeds':
@@ -46,6 +47,7 @@
 (require 'subr-x)
 (require 'cl-lib)
 (require 'seq)
+(require 'sqlite)
 
 ;; ═══════════════════════════════════════════════════════════════════════
 ;; Customization
@@ -273,52 +275,31 @@ connection from blocking translation indefinitely.  Set to nil or
   :group 'elfeed-translate)
 
 ;; ═══════════════════════════════════════════════════════════════════════
-;; Translation Cache
+;; Translation Cache (SQLite-backed)
 ;; ═══════════════════════════════════════════════════════════════════════
 
-(defvar elfeed-translate--cache (make-hash-table :test 'equal)
-  "Hash table mapping MD5 hash keys to translated strings.
-The key is the MD5 of the source text (title or content snippet),
-ensuring a flat key→value structure that maps cleanly to a future
-SQLite table (translations(key TEXT PRIMARY KEY, value TEXT)).")
-
-(defvar elfeed-translate--cache-dirty nil
-  "Non-nil when the cache has unsaved modifications.")
+(defvar elfeed-translate--db nil
+  "SQLite database connection for the translation cache.
+Opened by `elfeed-translate--load-cache' and closed by
+`elfeed-translate--close-cache'.  nil when not yet opened.")
 
 (defun elfeed-translate--cache-file ()
-  "Return the path to the persisted cache file."
+  "Return the path to the SQLite cache database file."
+  (expand-file-name "translate-cache.sqlite" elfeed-translate-output-dir))
+
+(defun elfeed-translate--old-cache-file ()
+  "Return the path to the legacy hash-table cache file."
   (expand-file-name "translate-cache.el" elfeed-translate-output-dir))
 
-(defun elfeed-translate--load-cache ()
-  "Load translation cache from disk into memory."
-  (let ((file (elfeed-translate--cache-file)))
-    (when (file-exists-p file)
-      (with-temp-buffer
-        (insert-file-contents file)
-        (goto-char (point-min))
-        (condition-case err
-            (let ((data (read (current-buffer))))
-              (if (hash-table-p data)
-                  (progn
-                    (setq elfeed-translate--cache data)
-                    (setq elfeed-translate--cache-dirty nil)
-                    (message "[elfeed-translate] Loaded %d cached translations"
-                             (hash-table-count data)))
-                (message "[elfeed-translate] Invalid cache format, ignoring")))
-          (error
-           (message "[elfeed-translate] Error reading cache file: %s"
-                    (error-message-string err))))))))
-
-(defun elfeed-translate--save-cache ()
-  "Persist the translation cache to disk."
-  (when elfeed-translate--cache-dirty
-    (let ((file (elfeed-translate--cache-file)))
-      (make-directory (file-name-directory file) t)
-      (with-temp-buffer
-        (let (print-level print-length)
-          (print elfeed-translate--cache (current-buffer)))
-        (write-region (point-min) (point-max) file nil 'silent))
-      (setq elfeed-translate--cache-dirty nil))))
+(defun elfeed-translate--cache-count ()
+  "Return the number of cached translations in the database."
+  (if (and elfeed-translate--db (sqlite-available-p))
+      (let ((result (sqlite-select elfeed-translate--db
+                                   "SELECT COUNT(*) FROM translations")))
+        (if result
+            (car (car result))
+          0))
+    0))
 
 (defun elfeed-translate--cache-key (text)
   "Return the MD5 hash of TEXT for use as a cache key."
@@ -327,13 +308,106 @@ SQLite table (translations(key TEXT PRIMARY KEY, value TEXT)).")
 (defun elfeed-translate--cache-get (text)
   "Return the cached translation for TEXT, or nil.
 The cache key is the MD5 of TEXT."
-  (gethash (elfeed-translate--cache-key text) elfeed-translate--cache))
+  (when (and elfeed-translate--db (sqlite-available-p))
+    (let ((result (sqlite-select elfeed-translate--db
+                                 "SELECT value FROM translations WHERE key = ?"
+                                 (list (elfeed-translate--cache-key text)))))
+      (when result
+        (car (car result))))))
 
-(defun elfeed-translate--cache-set (key translation)
-  "Store TRANSLATION in the cache under KEY (an MD5 hash string)."
-  (unless (equal key translation)
-    (puthash key translation elfeed-translate--cache)
-    (setq elfeed-translate--cache-dirty t)))
+(defun elfeed-translate--cache-set-batch (pairs)
+  "Store multiple translations in a single transaction.
+PAIRS is a list of (key . translation) cons cells, where key is an
+MD5 hash string.  Uses BEGIN/COMMIT for atomicity and efficiency."
+  (when (and elfeed-translate--db pairs (sqlite-available-p))
+    (sqlite-execute elfeed-translate--db "BEGIN")
+    (condition-case err
+        (progn
+          (dolist (pair pairs)
+            (let ((key (car pair))
+                  (translation (cdr pair)))
+              (unless (equal key translation)
+                (sqlite-execute
+                 elfeed-translate--db
+                 "INSERT OR REPLACE INTO translations (key, value) VALUES (?, ?)"
+                 (list key translation)))))
+          (sqlite-execute elfeed-translate--db "COMMIT"))
+      (error
+       (sqlite-execute elfeed-translate--db "ROLLBACK")
+       (message "[elfeed-translate] Cache transaction failed: %s"
+                (error-message-string err))))))
+
+(defun elfeed-translate--cache-clear ()
+  "Delete all cached translations from the database."
+  (when (and elfeed-translate--db (sqlite-available-p))
+    (sqlite-execute elfeed-translate--db "DELETE FROM translations")))
+
+(defun elfeed-translate--migrate-old-cache ()
+  "Migrate the legacy hash-table cache file to the SQLite database.
+Reads `translate-cache.el' (a printed hash-table with title-string
+keys), computes the MD5 of each key, and inserts it into the
+translations table.  After migration the old file is renamed to
+`translate-cache.el.migrated'."
+  (let ((old-file (elfeed-translate--old-cache-file)))
+    (when (file-exists-p old-file)
+      (message "[elfeed-translate] Migrating legacy cache to SQLite...")
+      (condition-case err
+          (with-temp-buffer
+            (insert-file-contents old-file)
+            (goto-char (point-min))
+            (let ((data (read (current-buffer))))
+              (if (hash-table-p data)
+                  (progn
+                    (sqlite-execute elfeed-translate--db "BEGIN")
+                    (maphash
+                     (lambda (original translation)
+                       (let ((key (elfeed-translate--cache-key original)))
+                         (unless (equal key translation)
+                           (sqlite-execute
+                            elfeed-translate--db
+                            "INSERT OR REPLACE INTO translations (key, value) VALUES (?, ?)"
+                            (list key translation)))))
+                     data)
+                    (sqlite-execute elfeed-translate--db "COMMIT")
+                    (let ((migrated (concat old-file ".migrated")))
+                      (rename-file old-file migrated t)
+                      (message "[elfeed-translate] Migrated %d entries to SQLite, old file renamed to %s"
+                               (hash-table-count data) migrated)))
+                (message "[elfeed-translate] Legacy cache is not a hash-table, skipping migration")))
+            ;; Discard any remaining unread data
+            nil))
+        (error
+         (message "[elfeed-translate] Migration failed: %s"
+                  (error-message-string err))))))
+
+(defun elfeed-translate--load-cache ()
+  "Open the SQLite cache database and initialise tables.
+If a legacy `translate-cache.el' exists, migrate it to SQLite."
+  (make-directory elfeed-translate-output-dir t)
+  (let ((db-file (elfeed-translate--cache-file)))
+    (setq elfeed-translate--db (sqlite-open db-file))
+    ;; Create schema if not exists
+    (sqlite-execute elfeed-translate--db
+                    "CREATE TABLE IF NOT EXISTS meta (
+                      key   TEXT PRIMARY KEY,
+                      value TEXT NOT NULL)")
+    (sqlite-execute elfeed-translate--db
+                    "CREATE TABLE IF NOT EXISTS translations (
+                      key   TEXT PRIMARY KEY,
+                      value TEXT NOT NULL)")
+    ;; Record schema version
+    (sqlite-execute elfeed-translate--db
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1')")
+    ;; Migrate legacy cache if present
+    (elfeed-translate--migrate-old-cache)
+    (message "[elfeed-translate] Cache opened — %d cached translation(s)"
+             (elfeed-translate--cache-count))))
+
+(defun elfeed-translate--close-cache ()
+  "Close the SQLite cache database connection."
+  (when (and elfeed-translate--db (sqlite-available-p))
+    (sqlite-close elfeed-translate--db)
+    (setq elfeed-translate--db nil)))
 
 ;; ═══════════════════════════════════════════════════════════════════════
 ;; Utility Functions
@@ -1013,8 +1087,7 @@ AFFECTED-FEEDS is a list of feed URLs to regenerate on completion."
        (lambda (pairs)
          (if pairs
              (progn
-               (dolist (pair pairs)
-                 (elfeed-translate--cache-set (car pair) (cdr pair)))
+               (elfeed-translate--cache-set-batch pairs)
                (message "[elfeed-translate] Batch %d/%d: %d ok"
                         batch-num total (length pairs)))
            (message "[elfeed-translate] Batch %d/%d: FAILED"
@@ -1022,7 +1095,6 @@ AFFECTED-FEEDS is a list of feed URLs to regenerate on completion."
          (if remaining
              (elfeed-translate--process-batches
               remaining affected-feeds)
-           (elfeed-translate--save-cache)
            (elfeed-translate--finalize affected-feeds)))
        nil  ; no-busy-guard
        prompt))))
@@ -1050,8 +1122,7 @@ dispatches the next pending batch(es) and finalises when done."
           (plist-put state :completed (1+ completed))
           (if pairs
               (progn
-                (dolist (pair pairs)
-                  (elfeed-translate--cache-set (car pair) (cdr pair)))
+                (elfeed-translate--cache-set-batch pairs)
                 (message
                  "[elfeed-translate] Batch completed: %d ok (%d/%d)"
                  (length pairs) (1+ completed) total))
@@ -1089,8 +1160,9 @@ cons cell (call-fn . (texts . prompt))."
   "Process a QUEUE of batches concurrently with a self-managed limiter.
 QUEUE is a list of cons cells (call-fn . (texts . prompt)).
 At most `elfeed-translate-max-concurrent' API requests are in flight
-at once.  The cache is saved and affected RSS files regenerated once
-every batch has completed.
+at once.  Translations are written to the SQLite cache in per-batch
+transactions, and affected RSS files are regenerated once every
+batch has completed.
 
 AFFECTED-FEEDS is a list of feed URLs to regenerate on completion.
 
@@ -1109,7 +1181,6 @@ invoked from process filters (async callbacks)."
                 :affected-feeds affected-feeds
                 :finalize-fn
                 (lambda ()
-                  (elfeed-translate--save-cache)
                   (elfeed-translate--finalize affected-feeds)
                   (setq elfeed-translate--busy nil)
                   (setq elfeed-translate--parallel-state nil))))
@@ -1216,7 +1287,7 @@ Hooked into `elfeed-search-mode-hook' so that opening Elfeed
     (setq elfeed-translate--setup-done t)
     (message "[elfeed-translate] Setup — %d feed(s), %d cached translation(s)"
              (length (elfeed-translate--translatable-feeds))
-             (hash-table-count elfeed-translate--cache))
+             (elfeed-translate--cache-count))
     (unless (featurep 'elfeed-search)
       (message "[elfeed-translate] Run M-x elfeed-translate-show-feeds to get your translated feed URLs")))
   ;; Always ensure the DB-update hook is installed (idempotent)
@@ -1224,10 +1295,10 @@ Hooked into `elfeed-search-mode-hook' so that opening Elfeed
 
 ;;;###autoload
 (defun elfeed-translate-teardown ()
-  "Remove elfeed-translate hooks and persist the cache."
+  "Remove elfeed-translate hooks and close the cache database."
   (interactive)
   (remove-hook 'elfeed-db-update-hook #'elfeed-translate--on-db-update)
-  (elfeed-translate--save-cache)
+  (elfeed-translate--close-cache)
   (message "[elfeed-translate] Teardown complete"))
 
 ;;;###autoload
@@ -1250,9 +1321,7 @@ Use this when you want to force a fresh translation of all content
 (with a new target language, for example)."
   (interactive)
   (when (yes-or-no-p "Clear all cached translations and re-translate everything? ")
-    (setq elfeed-translate--cache (make-hash-table :test 'equal))
-    (setq elfeed-translate--cache-dirty t)
-    (elfeed-translate--save-cache)
+    (elfeed-translate--cache-clear)
     ;; Regenerate empty RSS files (will be filled after next update)
     (dolist (feed-url (elfeed-translate--translatable-feeds))
       (elfeed-translate--generate-rss feed-url))
@@ -1314,7 +1383,7 @@ Shows all translatable feeds and their translation status."
   (interactive)
   (let* ((feeds (elfeed-translate--translatable-feeds))
          (lines '())
-         (total-cached (hash-table-count elfeed-translate--cache))
+         (total-cached (elfeed-translate--cache-count))
          (total-entries 0)
          (total-untranslated 0))
     (push (format "elfeed-translate status:
