@@ -274,6 +274,14 @@ connection from blocking translation indefinitely.  Set to nil or
                  (integer :tag "Seconds"))
   :group 'elfeed-translate)
 
+(defcustom elfeed-translate-max-retries 3
+  "Maximum number of retry attempts for a failed API batch.
+When a batch fails (timeout, HTTP error, parse error), it is
+retried up to this many times before giving up.  Set to 0 to
+disable retries."
+  :type 'integer
+  :group 'elfeed-translate)
+
 ;; ═══════════════════════════════════════════════════════════════════════
 ;; Translation Cache (SQLite-backed)
 ;; ═══════════════════════════════════════════════════════════════════════
@@ -523,8 +531,11 @@ translated title.  The separator is taken from
 
 (defun elfeed-translate--generate-rss (feed-url)
   "Generate a local RSS 2.0 XML file for FEED-URL.
-Includes only entries that have at least one cached translation
-(title or content).  Returns the path to the generated file."
+Includes entries that have at least one cached translation (title
+or content), OR any entry from the feed if the feed has a
+translate tag — original content is always included in
+<description>, translated only when `translate_content' is tagged
+and the translation is cached.  Returns the path to the generated file."
   (let* ((feed (elfeed-db-get-feed feed-url))
          (feed-title (if feed
                          (or (elfeed-feed-title feed) feed-url)
@@ -534,19 +545,23 @@ Includes only entries that have at least one cached translation
          (has-title-tag (elfeed-translate--feed-has-title-tag-p feed-url))
          (has-content-tag (elfeed-translate--feed-has-content-tag-p feed-url))
          (entries (elfeed-translate--entries-for-feed feed-url))
+         ;; Include an entry if it has any translation cached, OR if the
+         ;; feed has any translate tag (so original content is carried over
+         ;; even for entries whose translation hasn't completed yet).
          (translated-entries
           (seq-filter
            (lambda (e)
              (let ((title (elfeed-entry-title e))
-                   (content (when has-content-tag
-                              (elfeed-translate--entry-content e))))
+                   (content (elfeed-translate--entry-content e)))
                (or (and has-title-tag
                         title
                         (not (string-empty-p title))
                         (elfeed-translate--cache-get title))
                    (and has-content-tag
                         content
-                        (elfeed-translate--cache-get content)))))
+                        (elfeed-translate--cache-get content))
+                   has-title-tag
+                   has-content-tag)))
            entries))
          (file (elfeed-translate--local-feed-path feed-url)))
     (make-directory (file-name-directory file) t)
@@ -566,15 +581,14 @@ Includes only entries that have at least one cached translation
       ;; Entries
       (dolist (entry translated-entries)
         (let* ((original-title (elfeed-entry-title entry))
-               (content (when has-content-tag
-                          (elfeed-translate--entry-content entry)))
+               (raw-content (elfeed-translate--entry-content entry))
                (translated-title
                 (when (and has-title-tag original-title
                            (not (string-empty-p original-title)))
                   (elfeed-translate--cache-get original-title)))
                (translated-content
-                (when (and has-content-tag content)
-                  (elfeed-translate--cache-get content)))
+                (when (and has-content-tag raw-content)
+                  (elfeed-translate--cache-get raw-content)))
                ;; Decide display title
                (display-title
                 (cond
@@ -583,6 +597,12 @@ Includes only entries that have at least one cached translation
                  (translated-title translated-title)
                  (original-title original-title)
                  (t "")))
+               ;; Description: use translated if available, else original
+               (description
+                (cond
+                 (translated-content translated-content)
+                 (raw-content raw-content)
+                 (t nil)))
                (link (elfeed-entry-link entry))
                (guid (elfeed-translate--entry-guid feed-url entry))
                (date (elfeed-entry-date entry)))
@@ -595,9 +615,9 @@ Includes only entries that have at least one cached translation
                           (xml-escape-string guid)))
           (insert (format "      <pubDate>%s</pubDate>\n"
                           (elfeed-translate--rfc2822-date date)))
-          (when translated-content
+          (when description
             (insert (format "      <description>%s</description>\n"
-                            (xml-escape-string translated-content))))
+                            (xml-escape-string description))))
           (insert "    </item>\n")))
       (insert "  </channel>\n")
       (insert "</rss>\n")
@@ -1065,39 +1085,66 @@ scheduled update) will pick up the new content naturally."
   (message "[elfeed-translate] All batches complete — %d feed(s) updated"
            (length affected-feeds)))
 
+(defun elfeed-translate--process-batch-with-retry
+    (call-fn texts prompt on-done batch-num total)
+  "Send TEXTS via CALL-FN with PROMPT, retrying on failure.
+ON-DONE is called with PAIRS (non-nil on success, nil on final
+failure) when the batch either succeeds or exhausts retries.
+BATCH-NUM and TOTAL are for progress messages."
+  (let ((retries 0)
+        (done nil))
+    (let ((send
+           (lambda ()
+             (funcall
+              call-fn
+              texts
+              (lambda (pairs)
+                (cond
+                 (done nil)  ; safety: ignore late response
+                 (pairs
+                  (elfeed-translate--cache-set-batch pairs)
+                  (message "[elfeed-translate] Batch %d/%d: %d ok"
+                           batch-num total (length pairs))
+                  (setq done t)
+                  (funcall on-done pairs))
+                 ((< retries elfeed-translate-max-retries)
+                  (cl-incf retries)
+                  (message
+                   "[elfeed-translate] Batch %d/%d: FAILED, retrying (%d/%d)..."
+                   batch-num total retries elfeed-translate-max-retries)
+                  (funcall send))
+                 (t
+                  (message
+                   "[elfeed-translate] Batch %d/%d: FAILED (retries exhausted)"
+                   batch-num total)
+                  (setq done t)
+                  (funcall on-done nil))))
+              nil  ; no-busy-guard
+              prompt))))
+      (funcall send))))
+
 (defun elfeed-translate--process-batches (queue affected-feeds)
   "Process QUEUE sequentially, one API call per batch.
-QUEUE is a list of cons cells (call-fn . data) where call-fn is a
-function that accepts (texts callback no-busy-guard system-prompt)
-and data is (texts . system-prompt).
-AFFECTED-FEEDS is a list of feed URLs to regenerate on completion."
+QUEUE is a list of cons cells (call-fn . (texts . prompt)).
+AFFECTED-FEEDS is a list of feed URLs to regenerate on completion.
+Failed batches are retried up to `elfeed-translate-max-retries' times."
   (when queue
     (let* ((element (car queue))
            (remaining (cdr queue))
            (call-fn (car element))
-           (texts (cadr element))
-           (prompt (cddr element))
+           (texts (car (cdr element)))
+           (prompt (cdr (cdr element)))
            (total (length queue))
            (batch-num (- total (length queue) -1)))
       (message "[elfeed-translate] Batch %d/%d: translating %d items..."
                batch-num total (length texts))
-      (funcall
-       call-fn
-       texts
-       (lambda (pairs)
-         (if pairs
-             (progn
-               (elfeed-translate--cache-set-batch pairs)
-               (message "[elfeed-translate] Batch %d/%d: %d ok"
-                        batch-num total (length pairs)))
-           (message "[elfeed-translate] Batch %d/%d: FAILED"
-                    batch-num total))
+      (elfeed-translate--process-batch-with-retry
+       call-fn texts prompt
+       (lambda (_pairs)
          (if remaining
-             (elfeed-translate--process-batches
-              remaining affected-feeds)
+             (elfeed-translate--process-batches remaining affected-feeds)
            (elfeed-translate--finalize affected-feeds)))
-       nil  ; no-busy-guard
-       prompt))))
+       batch-num total))))
 
 (defvar elfeed-translate--parallel-state nil
   "Plist holding parallel-dispatch state between async callbacks.
@@ -1109,6 +1156,8 @@ Keys: :queue, :in-flight, :completed, :total, :max-concurrent,
 
 (defun elfeed-translate--parallel-callback (pairs)
   "Completion callback for one parallel API batch.
+Called by `elfeed-translate--process-batch-with-retry' after a
+batch succeeds (PAIRS non-nil) or exhausts retries (PAIRS nil).
 Reads and mutates `elfeed-translate--parallel-state'.  Decrements
 the in-flight counter, caches results if PAIRS is non-nil, then
 dispatches the next pending batch(es) and finalises when done."
@@ -1136,25 +1185,32 @@ dispatches the next pending batch(es) and finalises when done."
 (defun elfeed-translate--parallel-dispatch ()
   "Dispatch pending batches up to the concurrency limit.
 Reads `elfeed-translate--parallel-state'.  Each queue element is a
-cons cell (call-fn . (texts . prompt))."
+cons cell (call-fn . (texts . prompt)).  Uses
+`elfeed-translate--process-batch-with-retry' for retry logic,
+passing `elfeed-translate--parallel-callback' as the final
+on-success/failure callback."
   (let* ((state elfeed-translate--parallel-state)
          (queue (plist-get state :queue))
          (in-flight (plist-get state :in-flight))
-         (max-concurrent (plist-get state :max-concurrent)))
+         (max-concurrent (plist-get state :max-concurrent))
+         (total (plist-get state :total)))
     (while (and queue (< in-flight max-concurrent))
       (let* ((element (pop queue))
              (call-fn (car element))
              (data (cdr element))
              (texts (car data))
-             (prompt (cdr data)))
+             (prompt (cdr data))
+             (batch-num (- total (length queue))))
         (plist-put state :queue queue)
         (plist-put state :in-flight (1+ in-flight))
         (setq in-flight (1+ in-flight))
         (message
-         "[elfeed-translate] Dispatching batch (%d items)... (%d pending)"
-         (length texts) (length queue))
-        (funcall call-fn
-                 texts #'elfeed-translate--parallel-callback t prompt)))))
+         "[elfeed-translate] Dispatching batch %d/%d (%d items)... (%d pending)"
+         batch-num total (length texts) (length queue))
+        (elfeed-translate--process-batch-with-retry
+         call-fn texts prompt
+         (lambda (pairs) (elfeed-translate--parallel-callback pairs))
+         batch-num total)))))
 
 (defun elfeed-translate--process-batches-parallel (queue affected-feeds)
   "Process a QUEUE of batches concurrently with a self-managed limiter.
