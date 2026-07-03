@@ -282,6 +282,15 @@ disable retries."
   :type 'integer
   :group 'elfeed-translate)
 
+(defcustom elfeed-translate-auto-refresh nil
+  "When non-nil, automatically run `elfeed-update' after translation finishes.
+This lets Elfeed fetch the newly generated translated RSS files so
+translated titles/content appear in the search buffer without a
+manual second update.  A flag prevents infinite recursion: the
+auto-refresh update does not trigger another translation cycle."
+  :type 'boolean
+  :group 'elfeed-translate)
+
 ;; ═══════════════════════════════════════════════════════════════════════
 ;; Translation Cache (SQLite-backed)
 ;; ═══════════════════════════════════════════════════════════════════════
@@ -634,6 +643,21 @@ In serial mode this is set per API request and cleared on completion.
 In parallel mode it is held for the whole dispatch cycle and cleared
 once every batch has completed.  `elfeed-translate--on-db-update'
 checks this to avoid starting overlapping cycles.")
+
+(defvar elfeed-translate--feed-update-completed 0
+  "Counter: how many feeds have finished updating in the current cycle.
+Incremented by `elfeed-translate--on-feed-updated' on each
+`elfeed-update-hooks' callback.")
+
+(defvar elfeed-translate--feed-update-total 0
+  "Total number of feeds being updated in the current cycle.
+Set when `elfeed-update' is detected (via `elfeed-update-init-hooks').")
+
+(defvar elfeed-translate--auto-refreshing nil
+  "Non-nil when the current `elfeed-update' was auto-triggered by translation.
+Prevents infinite recursion: when auto-refresh's update completes,
+`elfeed-translate--on-all-feeds-updated' does not start another
+translation cycle.")
 
 (defun elfeed-translate--call-api (texts callback &optional no-busy-guard system-prompt)
   "Translate TEXTS (list of strings) via the configured LLM API.
@@ -1077,13 +1101,18 @@ file:// URLs point to up-to-date content."
 (defun elfeed-translate--finalize (affected-feeds)
   "After all batches complete: regenerate RSS files.
 AFFECTED-FEEDS is a list of feed URLs whose entries were translated.
-Only regenerates the local XML files — it does NOT call
-`elfeed-update-feed'.  The user's next `elfeed-update' (or
-scheduled update) will pick up the new content naturally."
+Regenerates the local XML files, then — if
+`elfeed-translate-auto-refresh' is enabled — triggers
+`elfeed-update' so Elfeed fetches the translated feeds.  The
+auto-refresh flag prevents recursive translation."
   (dolist (feed-url affected-feeds)
     (elfeed-translate--generate-rss feed-url))
   (message "[elfeed-translate] All batches complete — %d feed(s) updated"
-           (length affected-feeds)))
+           (length affected-feeds))
+  (when elfeed-translate-auto-refresh
+    (message "[elfeed-translate] Auto-refresh: triggering elfeed-update")
+    (setq elfeed-translate--auto-refreshing t)
+    (elfeed-update)))
 
 (defvar elfeed-translate--serial-completed nil
   "Counter for serial mode progress reporting.
@@ -1254,12 +1283,50 @@ invoked from process filters (async callbacks)."
     (setq elfeed-translate--busy t)
     (elfeed-translate--parallel-dispatch)))
 
+(defun elfeed-translate--on-feed-update-init ()
+  "Handle `elfeed-update-init-hooks': record the total feed count.
+Called when `elfeed-update' begins (or when individual feed updates
+are initiated outside a batch).  Sets the completion counter to 0
+and the total to the number of feeds in `elfeed-feeds'."
+  (setq elfeed-translate--feed-update-completed 0)
+  (setq elfeed-translate--feed-update-total (length (elfeed-feed-list)))
+  (when elfeed-translate-debug
+    (message "[elfeed-translate] Feed update started — %d feed(s) pending"
+             elfeed-translate--feed-update-total)))
+
+(defun elfeed-translate--on-feed-updated (_url)
+  "Handle `elfeed-update-hooks': increment the completion counter.
+URL is the feed that just finished (ignored).  When the counter
+reaches the total, calls `elfeed-translate--on-all-feeds-updated'."
+  (cl-incf elfeed-translate--feed-update-completed)
+  (when elfeed-translate-debug
+    (message "[elfeed-translate] Feed updated (%d/%d): %s"
+             elfeed-translate--feed-update-completed
+             elfeed-translate--feed-update-total _url))
+  (when (>= elfeed-translate--feed-update-completed
+            elfeed-translate--feed-update-total)
+    (elfeed-translate--on-all-feeds-updated)))
+
+(defun elfeed-translate--on-all-feeds-updated ()
+  "Called when all feeds have finished updating.
+If this update was auto-triggered by translation (auto-refresh),
+just reset the flag and return.  Otherwise, start a translation
+cycle via `elfeed-translate--on-db-update'."
+  (if elfeed-translate--auto-refreshing
+      (progn
+        (setq elfeed-translate--auto-refreshing nil)
+        (message "[elfeed-translate] Auto-refresh update complete"))
+    (message "[elfeed-translate] All feeds fetched — starting translation")
+    (elfeed-translate--on-db-update)))
+
 (defun elfeed-translate--on-db-update ()
-  "Handle `elfeed-db-update-hook': translate new entries, update RSS files.
-Collects untranslated titles and content independently, splits each
-into batches using the appropriate batch size, and processes them
-via async API calls — either sequentially or in parallel depending
-on `elfeed-translate-parallel'.
+  "Translate new entries and update RSS files.
+Called by `elfeed-translate--on-all-feeds-updated' after all feeds
+have finished updating, or by `elfeed-translate-update' for manual
+trigger.  Collects untranslated titles and content independently,
+splits each into batches using the appropriate batch size, and
+processes them via async API calls — either sequentially or in
+parallel depending on `elfeed-translate-parallel'.
 
 Title batches use `elfeed-translate-system-prompt' and
 `elfeed-translate-batch-size'.  Content batches use
@@ -1326,14 +1393,16 @@ processed as one cycle."
 (defun elfeed-translate-setup ()
   "Configure and enable elfeed-translate.
 Creates output directory, loads the translation cache, generates
-initial RSS files, and installs the update hook.
+initial RSS files, and installs the feed-update hooks.
 
 This function is idempotent — the heavy one-time work (directory
 creation, cache load, RSS generation) only runs on the first call.
-Subsequent calls merely ensure `elfeed-db-update-hook' is in place.
+Subsequent calls merely ensure the hooks are in place.
 
-Hooked into `elfeed-search-mode-hook' so that opening Elfeed
-(\"M-x elfeed\") automatically loads the cache and enables translation."
+Hooks into `elfeed-search-mode-hook' so that opening Elfeed
+(\"M-x elfeed\") automatically loads the cache and enables translation.
+Translation is triggered after ALL feeds finish updating (via
+`elfeed-update-hooks' with a completion counter), not per-feed."
   (interactive)
   (unless elfeed-translate-api-key
     (display-warning
@@ -1359,14 +1428,16 @@ Hooked into `elfeed-search-mode-hook' so that opening Elfeed
              (elfeed-translate--cache-count))
     (unless (featurep 'elfeed-search)
       (message "[elfeed-translate] Run M-x elfeed-translate-show-feeds to get your translated feed URLs")))
-  ;; Always ensure the DB-update hook is installed (idempotent)
-  (add-hook 'elfeed-db-update-hook #'elfeed-translate--on-db-update))
+  ;; Always ensure hooks are installed (idempotent)
+  (add-hook 'elfeed-update-init-hooks #'elfeed-translate--on-feed-update-init)
+  (add-hook 'elfeed-update-hooks #'elfeed-translate--on-feed-updated))
 
 ;;;###autoload
 (defun elfeed-translate-teardown ()
   "Remove elfeed-translate hooks and close the cache database."
   (interactive)
-  (remove-hook 'elfeed-db-update-hook #'elfeed-translate--on-db-update)
+  (remove-hook 'elfeed-update-init-hooks #'elfeed-translate--on-feed-update-init)
+  (remove-hook 'elfeed-update-hooks #'elfeed-translate--on-feed-updated)
   (elfeed-translate--close-cache)
   (message "[elfeed-translate] Teardown complete"))
 
@@ -1525,7 +1596,10 @@ Shows all translatable feeds and their translation status."
   "Toggle automatic translation of Elfeed entry titles and content.
 When enabled, entries of feeds tagged with `elfeed-translate-feed-tag'
 and/or `elfeed-translate-content-tag' are automatically translated
-after each feed update via the configured LLM API."
+after all feeds finish updating.  If
+`elfeed-translate-auto-refresh' is enabled, `elfeed-update' is
+re-triggered after translation so translated content appears
+automatically."
   :global t
   :lighter " ELTL"
   (if global-elfeed-translate-mode
@@ -1536,7 +1610,7 @@ after each feed update via the configured LLM API."
 ;; Auto-start hook: run setup whenever the Elfeed search buffer opens.
 ;; This mirrors how elfeed-org hooks into elfeed-search-mode-hook to
 ;; load feeds — here we load the translation cache and enable the
-;; db-update-hook automatically.  The setup function is idempotent so
+;; feed-update hooks automatically.  The setup function is idempotent so
 ;; repeated calls are cheap.
 ;; ═══════════════════════════════════════════════════════════════════════
 
