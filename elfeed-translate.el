@@ -393,9 +393,9 @@ translations table.  After migration the old file is renamed to
                 (message "[elfeed-translate] Legacy cache is not a hash-table, skipping migration")))
             ;; Discard any remaining unread data
             nil))
-        (error
-         (message "[elfeed-translate] Migration failed: %s"
-                  (error-message-string err))))))
+      (error
+       (message "[elfeed-translate] Migration failed: %s"
+                (error-message-string err))))))
 
 (defun elfeed-translate--load-cache ()
   "Open the SQLite cache database and initialise tables.
@@ -1603,7 +1603,7 @@ automatically."
   :global t
   :lighter " ELTL"
   (if global-elfeed-translate-mode
-      (elfeed-translate-setup)
+      (add-hook 'elfeed-search-mode-hook #'elfeed-translate-setup)
     (elfeed-translate-teardown)))
 
 ;; ═══════════════════════════════════════════════════════════════════════
@@ -1615,7 +1615,7 @@ automatically."
 ;; ═══════════════════════════════════════════════════════════════════════
 
 ;;;###autoload
-(add-hook 'elfeed-search-mode-hook #'elfeed-translate-setup)
+
 
 (provide 'elfeed-translate)
 ;;; elfeed-translate.el ends here
