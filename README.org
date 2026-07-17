@@ -37,6 +37,10 @@ Prefer =auth-source= or another secret store over a literal key.  API keys must
 be ASCII strings; the package validates and normalizes HTTP headers before a
 request is sent.
 
+The repository is a multi-file package.  Straight places the repository on
+=load-path=, so =(require 'elfeed-translate)= loads all internal modules; no
+additional Straight recipe entries are needed.
+
 * Single Target Language Policy
 
 One running installation is intentionally treated as having one global target
@@ -171,6 +175,43 @@ GUIDs combine the feed hash with the original entry id to avoid collisions.
 Title display formatting is applied only during RSS generation, so changing
 =elfeed-translate-title-style= or =elfeed-translate-title-separator= does not
 invalidate cached translations.
+
+Generated RSS is always written as UTF-8 with Unix line endings, including on
+Windows where the default file coding system may otherwise be a locale code
+page.
+
+* Source Modules
+
+The public entry point remains =elfeed-translate.el=.  It loads four internal
+modules from the same repository:
+
+| File | Responsibility |
+|------+----------------|
+| =elfeed-translate-core.el= | Customization and shared result values |
+| =elfeed-translate-cache.el= | SQLite persistence and cache-key ownership |
+| =elfeed-translate-api.el= | Request encoding, HTTP and response parsing |
+| =elfeed-translate-elfeed.el= | Elfeed DB access, feed paths and RSS rendering |
+| =elfeed-translate.el= | Public commands, hooks, collection and batch dispatch |
+
+The API returns source-text/translation pairs and has no knowledge of SQLite.
+The cache module alone converts source text to MD5 keys.  Likewise, the API
+performs one HTTP request without reading the translation-cycle busy state;
+serial and parallel coordination remains in the main facade for now.
+
+* Tests
+
+Offline ERT suites live under =test/=, with one test module per source module.
+For a standard Straight checkout:
+
+#+begin_src shell
+emacs --batch -Q -L . -L test \
+  -L ~/.emacs.d/straight/build/elfeed \
+  -l test/run-tests.el
+#+end_src
+
+The tests do not contact a translation provider.  They cover UTF-8 request and
+RSS encoding, id-based pairing, =finish_reason= classification, SQLite cache
+transactions, Elfeed RSS generation, module loading and batch collection.
 
 * Debugging
 

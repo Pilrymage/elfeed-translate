@@ -4,20 +4,21 @@ Guide for AI agents working in `elfeed-translate`.
 
 ## Project
 
-`elfeed-translate.el` is a single-file Emacs Lisp package that translates
-Elfeed entry titles and/or content through an OpenAI-compatible
+`elfeed-translate` is a five-file Emacs Lisp package that translates Elfeed
+entry titles and/or content through an OpenAI-compatible
 `/chat/completions` API. It writes separate local RSS 2.0 feeds so original
 subscriptions and Elfeed entries remain untouched.
 
 - Emacs >= 29.1, Elfeed >= 3.0.
 - Lexical binding is enabled.
 - SQLite stores translations incrementally.
-- There is no build system, committed test suite, CI, or Makefile.
+- There is no build system, CI, or Makefile. Offline ERT tests live in `test/`.
 - `README.org` is user-facing; `DEVELOPER.org` is the authoritative architecture
   and protocol document. Read `DEVELOPER.org` before non-trivial changes.
 
-The single-file layout is intentional. Do not split the package unless the user
-explicitly requests it.
+The dispatch engine intentionally remains in `elfeed-translate.el` for this
+stage. Do not extract a sixth engine module until the user has validated the
+five-file version.
 
 ## Design Invariants
 
@@ -34,27 +35,36 @@ explicitly requests it.
 ## Repository Layout
 
 ```text
-elfeed-translate.el   package code
-README.org            installation, configuration and behavior
-DEVELOPER.org         architecture, protocol, retry policy and gotchas
-LICENSE               GPL-3.0-or-later
-screenshots/          user-facing images
+elfeed-translate.el          public facade, hooks and batch dispatch
+elfeed-translate-core.el     customization and result helpers
+elfeed-translate-cache.el    SQLite persistence
+elfeed-translate-api.el      HTTP and translation protocol
+elfeed-translate-elfeed.el   Elfeed DB adapter and RSS rendering
+test/                        offline ERT suites and batch runner
+README.org                   installation, configuration and behavior
+DEVELOPER.org                architecture, protocol, retry policy and gotchas
+LICENSE                      GPL-3.0-or-later
+screenshots/                 user-facing images
 ```
 
 ## Validation
 
-- Evaluate: `M-x eval-buffer` in `elfeed-translate.el`.
-- Parentheses: run `check-parens` in the source buffer.
-- Byte compile: `emacs --batch -f batch-byte-compile elfeed-translate.el` with
-  Elfeed on `load-path`.
+- Load: put the repository and Elfeed on `load-path`, then evaluate
+  `(require 'elfeed-translate)`.
+- Parentheses: run `check-parens` in every source and test buffer.
+- Tests: `emacs --batch -Q -L . -L test -L /path/to/straight/build/elfeed
+  -l test/run-tests.el`.
+- Byte compile all five source files and tests with Elfeed on `load-path`.
+- `emacsclient` smoke tests should use a temporary named daemon rather than
+  loading test code into the user's active Emacs server.
 - Live API: enable `elfeed-translate-debug`, then run
   `M-x elfeed-translate-test-api`.
 - Interactive workflow: open Elfeed, update once to translate, inspect
   `~/.elfeed/translated/*.xml`, and update again to verify cache hits.
 
-Synthetic buffer and callback tests are encouraged for request encoding,
-id-JSON parsing, `finish_reason` classification, and serial/parallel retry state.
-They need not call a real provider.
+The committed tests use synthetic buffers and callbacks for request encoding,
+id-JSON parsing, `finish_reason`, SQLite, RSS and module boundaries. They do not
+call a real provider.
 
 ## Architecture Summary
 
@@ -81,6 +91,16 @@ Important structures:
 - Parallel state includes `:queue`, `:in-flight`, `:retry-waiting`, `:completed`
   and `:total`.
 
+Module boundaries:
+
+- Only the cache module computes MD5 keys. API success pairs contain source
+  text, not cache keys.
+- The API module performs one request and must not touch the cycle-level busy
+  state.
+- The Elfeed adapter accepts a translation lookup function when rendering RSS;
+  it must not require the cache module.
+- The facade owns cross-module orchestration, collection and retry dispatch.
+
 ## Naming and File Conventions
 
 - Public symbols: `elfeed-translate-<name>`.
@@ -89,6 +109,8 @@ Important structures:
 - Keep all `defcustom` values in the `elfeed-translate` group.
 - Preserve `;;;###autoload` cookies on interactive commands and mode entry points.
 - Match the existing Unicode box-drawing section headers.
+- Every internal file provides its matching feature and can be byte-compiled
+  independently with dependencies on `load-path`.
 - Preserve unrelated user changes in a dirty worktree.
 
 ## Critical Gotchas
@@ -121,6 +143,7 @@ Important structures:
     cached raw translations.
 12. Feed autotag checks use symbols and `memq`; retain compatibility with
     elfeed-org underscore tags.
+13. RSS declares UTF-8 and must bind `coding-system-for-write` to `utf-8-unix`.
 
 ## Elfeed Integration
 

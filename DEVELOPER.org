@@ -5,8 +5,8 @@
 
 * Scope and Design Invariants
 
-=elfeed-translate= is a single-file Emacs Lisp package that translates Elfeed
-entry titles and/or content through an OpenAI-compatible chat-completions API.
+=elfeed-translate= is a modular Emacs Lisp package that translates Elfeed entry
+titles and/or content through an OpenAI-compatible chat-completions API.
 It generates separate local RSS 2.0 feeds instead of mutating original entries.
 
 The following are intentional invariants:
@@ -24,20 +24,23 @@ explicit cache clear.
 
 * Source Layout
 
-The project intentionally keeps all package code in =elfeed-translate.el=.
+The package facade and four internal modules live together on =load-path=.
+Users continue to load only =(require 'elfeed-translate)=.
 
-| Section | Responsibility |
-|---------+----------------|
-| Customization | API, prompts, tags, batch sizes, concurrency, timeout and retry options |
-| SQLite Cache | Schema, migration, lookup and transactional writes |
-| Utilities | Feed mapping, content extraction, autotags and GUIDs |
-| RSS Generation | Local RSS 2.0 files and title formatting |
-| API Client | Request validation, HTTP transport, response parsing and diagnostics |
-| Core Collection | Find uncached title/content work |
-| Feed Display | Generate copyable local subscription definitions |
-| Dispatch | Serial/parallel queues, retry timers and finalization |
-| Public Commands | Setup, test, update, cache and statistics commands |
-| Global Mode | Install setup on =elfeed-search-mode-hook= |
+| File | Responsibility |
+|------+----------------|
+| =elfeed-translate.el= | Public commands, setup/teardown, update hooks, collection, serial/parallel dispatch and global mode |
+| =elfeed-translate-core.el= | Customization and shared structured-result helpers |
+| =elfeed-translate-cache.el= | SQLite schema, migration, lookup, cache-key generation and transactional writes |
+| =elfeed-translate-api.el= | Request validation, HTTP transport, response parsing and diagnostics |
+| =elfeed-translate-elfeed.el= | Elfeed DB/tag access, entry extraction, feed paths, RSS rendering and display helpers |
+| =test/*.el= | Offline ERT tests, one suite per source module, plus the batch runner |
+
+Dependencies are deliberately one-way.  The facade requires all four internal
+modules.  Cache and API require core; the Elfeed adapter requires core.  The API
+does not know SQLite cache keys or translation-cycle busy state.  RSS rendering
+receives a translation lookup function from the facade, so the Elfeed adapter
+does not require the cache module.
 
 Dependencies are built into Emacs 29.1 except Elfeed: =url=, =json=, =sqlite=,
 =xml=, =subr-x=, =cl-lib= and =seq=.
@@ -135,11 +138,12 @@ failure and is retried.
 
 Callbacks receive a plist rather than a pairs-or-nil value.
 
-Success:
+Success contains source-text/translation pairs; MD5 keys are computed only by
+the cache module:
 
 #+begin_src elisp
 (:ok t
- :pairs ((CACHE-KEY . "translation"))
+ :pairs (("source text" . "translation"))
  :http-status 200
  :finish-reason "stop"
  :protocol id-json)
@@ -241,15 +245,15 @@ Its report contains:
 - a permanently redacted API key field.
 
 Failed raw responses are appended to =*elfeed-translate-debug*= with timestamp,
-reason and cache-key count.  HTTP provider error JSON is summarized when
+reason and source-item count.  HTTP provider error JSON is summarized when
 possible.
 
 * Critical Implementation Notes
 
 1. Always pass =:object-type=, =:array-type=, =:null-object= and
    =:false-object= directly to =json-parse-string=.
-2. Clear a per-request busy lock before invoking the next callback; current
-   serial dispatch instead owns the busy lock for the complete cycle.
+2. The API module must not read or mutate =elfeed-translate--busy=.  Serial and
+   parallel dispatch in the facade own the lock for the complete cycle.
 3. Do not replace direct =url-retrieve= with =url-queue-retrieve=: delayed
    execution loses dynamic request bindings.
 4. Preserve the timeout =done= guard to prevent double callbacks.
@@ -258,16 +262,27 @@ possible.
 6. Preserve id validation before cache writes.  Partial batches must never be
    cached by position.
 7. Do not print or dump Authorization headers.
+8. Keep RSS output explicitly bound to =utf-8-unix=; its XML declaration says
+   UTF-8 and Windows otherwise may use the locale code page.
 
 * Validation
 
-There is no committed automated test suite.  Before releasing changes:
+Run the committed offline suite with Elfeed on =load-path=:
 
-1. Run =check-parens= or evaluate the source buffer.
-2. Byte-compile with Elfeed on =load-path=.
-3. Test request construction with a multibyte ASCII key and non-ASCII prompt.
-4. Exercise synthetic 200, malformed-id, truncated, 429 and network results.
-5. Exercise serial and parallel delayed retries and confirm the busy lock and
+#+begin_src shell
+emacs --batch -Q -L . -L test -L /path/to/straight/build/elfeed \
+  -l test/run-tests.el
+#+end_src
+
+The suite covers every source module: request encoding and parsing, id pairing,
+=finish_reason=, isolated SQLite persistence, injected RSS lookup and UTF-8
+output, module ownership, collection and batching.  Before releasing changes:
+
+1. Run the ERT suite and =check-parens= for every source file.
+2. Byte-compile all source and test modules with Elfeed on =load-path=.
+3. Optionally start a temporary daemon and use =emacsclient= to require the
+   facade and confirm =symbol-file= ownership for each internal function.
+4. Exercise serial and parallel delayed retries and confirm the busy lock and
    parallel state are cleared exactly once.
-6. Run =M-x elfeed-translate-test-api= against the configured provider.
-7. Run an Elfeed update twice and verify the second cycle is a cache hit.
+5. Run =M-x elfeed-translate-test-api= against the configured provider.
+6. Run an Elfeed update twice and verify the second cycle is a cache hit.
