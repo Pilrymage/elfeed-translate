@@ -3,467 +3,271 @@
 #+LANGUAGE: en
 #+PROPERTY: header-args:elisp :lexical t
 
-* Architecture Overview
-
-  =elfeed-translate= is a single-file Emacs Lisp package (~920 lines)
-  that translates Elfeed RSS entry titles using any OpenAI-compatible
-  LLM API.  It generates local RSS 2.0 XML files as /separate
-  subscription sources/, leaving the original feeds untouched.
-
-  The package is organized into these logical sections (in file
-  order):
-
-  | Section              | Lines   | Purpose                                                         |
-  |----------------------+---------+-----------------------------------------------------------------|
-  | Customization        | ~42–174 | =defgroup= + 14 =defcustom= options                              |
-  | Translation Cache    | ~175–229| Hash-table cache with disk persistence                          |
-  | Utility Functions    | ~230–298| Feed hashing, file paths, GUID generation, autotag helpers       |
-  | RSS XML Generation   | ~299–370| RSS 2.0 XML output, title formatting                            |
-  | API Client           | ~371–562| HTTP request/response, JSON parsing, batch translation           |
-  | Core Translation     | ~563–578| Collecting untranslated titles across tagged feeds               |
-  | Feed List Display    | ~579–665| =show-feeds= buffer (org / Elisp format)                         |
-  | DB Update Handler    | ~666–751| Hook integration, batch splitting, async processing chain        |
-  | Public Commands      | ~752–888| =setup=, =teardown=, =update=, =clear-cache=, =stats=            |
-  | Global Minor Mode    | ~889–915| =global-elfeed-translate-mode=, =elfeed-search-mode-hook=         |
-
-* Data Flow (End-to-End Lifecycle)
-
-  #+begin_src text
-  M-x elfeed
-    └─ elfeed-search-mode-hook
-         └─ elfeed-translate-setup()       ★ 幂等；首次加载缓存 / 生成初始 RSS
-
-  M-x elfeed-update
-    └─ Elfeed fetches all feeds in elfeed-feeds
-         └─ Entries parsed & added to elfeed-db
-              └─ elfeed-db-update-hook fires
-                   └─ elfeed-translate--on-db-update()
-                        │
-                        ├─ 检查 busy 锁 → 如果忙则跳过
-                        ├─ (elfeed-translate--translatable-feeds)  → 获取标记了 translate-title 的 feed URL
-                        ├─ (elfeed-translate--collect-untranslated) → 遍历每个 feed 的条目，检查缓存
-                        │     缓存 key = (elfeed-entry-title entry)  即原始标题
-                        │     缓存命中 → 跳过
-                        │     缓存未命中 → 加入待翻译列表
-                        │
-                        ├─ 去重 → 分批 (elfeed-translate-batch-size, 默认 30)
-                        ├─ (elfeed-translate--process-batches)        ★ 递归异步链
-                        │      │
-                        │      ├─ Batch 1: call-api(titles, callback)
-                        │      │    └─ url-retrieve → 异步等待响应
-                        │      │         └─ 回调: 解析 JSON → 存入缓存 → 递归调用 process-batches(batch2, ...)
-                        │      │
-                        │      ├─ Batch 2: call-api(titles2, callback)
-                        │      │    └─ ...同上...
-                        │      │
-                        │      └─ 所有批次完成:
-                        │           ├─ (elfeed-translate--save-cache)    ← 持久化到磁盘
-                        │           └─ (elfeed-translate--finalize)      ← 重新生成所有受影响 feed 的 RSS 文件
-                        │
-  [用户再次 M-x elfeed-update]
-    └─ Elfeed 抓取所有 feed（包括翻译后的本地 file:// 订阅）
-         └─ 翻译标题出现在搜索列表中（带 translated 标签）
-  #+end_src
-
-* Key Data Structures
-
-  ** Translation Cache
-
-     #+begin_src elisp
-       (defvar elfeed-translate--cache (make-hash-table :test 'equal))
-       ;; Key:   original title string (from elfeed-entry-title)
-       ;; Value: translated title string
-     #+end_src
-
-     Persisted to =~/.elfeed/translated/translate-cache.el= as a
-     printed hash-table (readable by =read=).  Uses =equal= test so
-     string keys work correctly.
-
-     The cache is saved /only/ after all API batches complete.  If
-     Emacs crashes mid-translation, unsaved batches are lost (but this
-     is acceptable — they'll be re-translated on next update).
-
-  ** Feed-to-File Mapping
-
-     Each original feed URL → one local RSS file:
-
-     #+begin_src elisp
-       (defun elfeed-translate--local-feed-path (feed-url)
-         (let ((hash (secure-hash 'md5 feed-url))
-               (dir  (expand-file-name elfeed-translate-output-dir)))
-           (expand-file-name (concat hash ".xml") dir)))
-     #+end_src
-
-     The MD5 hash is /stable/ — the same URL always produces the same
-     filename, so users can safely hard-code file:// URLs in their
-     config.
-
-  ** Title-to-Feed Reverse Index
-
-     During batch processing, a temporary hash table maps each
-     /original title/ to the list of feed URLs that contain that
-     title:
-
-     #+begin_src elisp
-       (make-hash-table :test 'equal)
-       ;; Key:   original title string
-       ;; Value: list of feed-url strings
-     #+end_src
-
-     This handles the case where the same title appears in multiple
-     feeds (e.g., cross-posted articles).  After translation, all
-     affected feeds' RSS files are regenerated.
-
-  ** Elfeed Integration Points
-
-     | Variable / Hook               | How elfeed-translate uses it                       |
-     |-------------------------------+---------------------------------------------------|
-     | =elfeed-feeds=                | Iterated to find feeds with =translate-title= tag  |
-     | =elfeed-db-entries=           | Scanned by =entries-for-feed= to collect titles     |
-     | =elfeed-db-get-feed=          | Looks up feed struct by URL                        |
-     | =elfeed-feed-autotags=        | Wrapped by =feed-autotags= to check for translate tag |
-     | =elfeed-search-mode-hook=     | Triggers =setup= when Elfeed opens                  |
-     | =elfeed-db-update-hook=       | Triggers =on-db-update= after each feed fetch       |
-     | =elfeed-entry-title=          | Accessor for entry title (cache key)                |
-     | =elfeed-entry-link=           | Copied to generated RSS =<link>=                     |
-     | =elfeed-entry-date=           | Copied to generated RSS =<pubDate>=                  |
-     | =elfeed-entry-id=             | Used as base for generated RSS =<guid>=              |
-     | =elfeed-entry-feed-id=        | Links entry back to its source feed URL             |
-     | =elfeed-feed-title=           | Used in =show-feeds= org link description            |
-
-* Function Call Graph
-
-  #+begin_src text
-  elfeed-translate-setup
-    ├─ elfeed-translate--translatable-feeds
-    │    └─ elfeed-translate--feed-has-tag-p
-    │         └─ elfeed-translate--feed-autotags
-    │              └─ elfeed-feed-autotags  (Elfeed built-in)
-    ├─ elfeed-translate--load-cache
-    ├─ elfeed-translate--generate-rss
-    └─ add-hook → elfeed-db-update-hook
-
-  elfeed-translate--on-db-update
-    ├─ elfeed-translate--translatable-feeds
-    ├─ elfeed-translate--collect-untranslated
-    │    ├─ elfeed-translate--entries-for-feed
-    │    └─ elfeed-translate--cache-get
-    ├─ elfeed-translate--split-into-batches
-    └─ elfeed-translate--process-batches
-         └─ elfeed-translate--call-api  (recursive via callback)
-              ├─ url-retrieve (async)
-              └─ elfeed-translate--parse-response
-                   ├─ elfeed-translate--extract-body
-                   ├─ json-parse-string
-                   └─ split-string (on "---" separator)
-         └─ elfeed-translate--save-cache
-         └─ elfeed-translate--finalize
-              └─ elfeed-translate--generate-rss
-                   └─ elfeed-translate--format-title
-  #+end_src
-
-* Naming Conventions
-
-  - Public functions: =elfeed-translate-<name>= (no double dash)
-  - Private functions: =elfeed-translate--<name>= (double dash)
-  - Private variables: =elfeed-translate--<name>= (double dash)
-  - Public customize variables: =elfeed-translate-<name>= (no double dash)
-  - All =defcustom= in =elfeed-translate= group (=:group 'elfeed=)
-
-* API Client Details
-
-  ** Request Format (OpenAI-compatible)
-
-     #+begin_src js
-       {
-         "model": "gpt-4o-mini",
-         "messages": [
-           {"role": "system", "content": "<system-prompt>"},
-           {"role": "user",   "content": "title1\n---\ntitle2\n---\ntitle3"}
-         ],
-         "temperature": 0.3
-       }
-     #+end_src
-
-     Titles are separated by ="\n---\n"= in the user message.  The
-     system prompt instructs the model to return translations
-     separated by the same marker.
-
-  ** Response Parsing
-
-     1. Extract HTTP body (skip headers via =re-search-forward
-        "^\r?\n"=)
-     2. =string-trim= the body
-     3. Parse JSON with =json-parse-string= using =:object-type
-        'alist= (CRITICAL: must pass as keyword argument, NOT rely on
-        dynamic variable binding — passing any keyword like
-        =:null-object= causes Emacs to ignore =json-object-type=)
-     4. Retry with =:allow-trailing-content t= on parse failure
-     5. Navigate =choices[0].message.content=
-     6. Split content by ="---"= and pair with input titles in order
-     7. Fallback: if counts mismatch, try splitting by newlines
-
-  ** Batch Processing Architecture
-
-     Titles are split into batches of =elfeed-translate-batch-size=
-     (default 30).  Batches are processed /sequentially/ via a
-     recursive callback chain:
-
-     #+begin_src elisp
-       (defun elfeed-translate--process-batches (batches title->feeds total-batches)
-         (when batches
-           (let ((batch (car batches))
-                 (remaining (cdr batches)))
-             (elfeed-translate--call-api
-              batch
-              (lambda (pairs)
-                ;; Store results
-                (dolist (pair pairs)
-                  (elfeed-translate--cache-set (car pair) (cdr pair)))
-                ;; Recurse to next batch, or finalize
-                (if remaining
-                    (elfeed-translate--process-batches remaining ...)
-                  (elfeed-translate--save-cache)
-                  (elfeed-translate--finalize ...)))))))
-     #+end_src
-
-     Each batch's API call is async (=url-retrieve=).  The callback
-     stores results and recursively triggers the next batch.  Only
-     /after/ all batches complete is the cache saved and RSS
-     regenerated.
-
-  ** Concurrency Guard (=elfeed-translate--busy=)
-
-     - Set to =t= before each =url-retrieve=
-     - Cleared in the callback /before/ the lambda callback is invoked
-       (allowing the next batch in the chain to start)
-     - Also cleared in =unwind-protect= cleanup form as safety net
-     - =on-db-update= checks =busy= before starting a new translation
-       cycle, preventing duplicate API calls if the hook fires during
-       an active cycle
-
-  ** Prompt Engineering
-
-     The system prompt (=elfeed-translate-system-prompt=) uses a
-     few-shot example:
-     - Shows input format (3 titles separated by =---=)
-     - Shows expected output format
-     - Emphasizes "Do NOT add numbers, bullets, quotes"
-     - Instructs: "If already in target language, output unchanged"
-
-     Known sensitivity: models sometimes still add numbering or
-     quotes.  The fallback line-by-line parsing helps.  If a non-LLM
-     model (e.g., older GLM/Zhipu) is used, consider lowering
-     =batch-size= to ~10-15.
-
-* RSS Generation
-
-  ** Output Format
-
-     RSS 2.0 XML with Atom self-link:
-
-     #+begin_src xml
-       <?xml version="1.0" encoding="UTF-8"?>
-       <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
-         <channel>
-           <title>[TL] Original Feed Title</title>
-           <link>https://original-feed-url</link>
-           <description>Auto-translated RSS feed for ...</description>
-           <atom:link href="file:///..." rel="self" type="application/rss+xml"/>
-           <item>
-             <title>Translated Title</title>
-             <link>https://original-entry-link</link>
-             <guid isPermaLink="false">feedhash:entryid</guid>
-             <pubDate>Tue, 01 Jun 2026 18:00:00 +0000</pubDate>
-           </item>
-         </channel>
-       </rss>
-     #+end_src
-
-  ** GUID Scheme
-
-     Entry GUIDs in the generated RSS are composite:
-     =<MD5(feed-url)>:<original-entry-id>=.
-
-     This prevents ID collisions when two different original feeds
-     happen to have entries with the same GUID (rare but possible).
-     Since the translated feed's namespace is =""= (empty, from the
- =file:///= URL), all translated feeds share the same namespace,
-     making the composite GUID essential.
-
-  ** Title Formatting
-
-     =elfeed-translate--format-title= applies
- =elfeed-translate-title-style= at RSS generation time /only/.
-     The cache always stores the raw translation (no formatting).
-     This means:
-
-     - Changing =title-style= or =title-separator= does /not/ require
-       cache invalidation
-     - Just call =M-x elfeed-translate-update= or regenerate RSS files
-
-* Cache Persistence
-
-  ** File Location
-
-     =~/.elfeed/translated/translate-cache.el=
-
-  ** File Format
-
-     A single Emacs Lisp expression: a hash-table printed by =print=:
-
-     #+begin_src elisp
-       #s(hash-table test equal data
-          ("Original Title 1" "翻译标题1"
-           "Original Title 2" "翻译标题2"))
-     #+end_src
-
-  ** Loading
-
-     Read via =read= from a temp buffer.  Validated with
- =hash-table-p=.  On error, the cache is silently reset to empty
-     (previous translations are lost but no data corruption occurs).
-
-  ** Dirty Flag
-
- =elfeed-translate--cache-dirty= is set to =t= by =cache-set=.
-     It's cleared by =save-cache=.  =save-cache= is a no-op when
- =dirty= is =nil=.
-
-  ** Known Limitation
-
-     =cache-set= does /not/ store when the translation is identical to
-     the original (=equal= returns =t=).  This was intended to avoid
-     wasting cache entries on "already in target language" titles, but
-     it means those titles are re-scanned on every update.  A future
-     fix could cache them with a sentinel value.
-
-* Feed Tag System
-
-  ** How Feeds Are Identified for Translation
-
-     1. =elfeed-translate--translatable-feeds= iterates over
- =elfeed-feeds=
-     2. For each entry, extracts the URL (=car= if cons, else the
-        string itself)
-     3. Calls =elfeed-feed-autotags(url)= (Elfeed built-in)
-     4. Checks if =elfeed-translate-feed-tag= is =memq= in the
-        autotags list
-
-     =elfeed-feed-autotags= converts keyword symbols (=:translate-title=)
-     to plain symbols (=translate-title=) via
- =elfeed-keyword->symbol=, so both formats work.
-
-  ** elfeed-org Compatibility
-
-     In =elfeed-org=, org headlines use colon-tag syntax
-     (=:translate_title:=).  When =elfeed-org= parses the org file,
-     these become autotags on the feed.  =elfeed-feed-autotags=
-     converts them to plain symbols.  Our =memq= check then matches.
-
-     The default =elfeed-translate-feed-tag= is =translate_title=
-     (underscore) to match org-mode tag conventions, but users can set
-     it to =translate-title= for direct =elfeed-feeds= usage.
-
-* show-feeds Buffer
-
-  ** Dual Output Modes
-
-     | Condition            | Format         | Mode          |
-     |----------------------+----------------+---------------|
-     | =elfeed-org= loaded  | Org headlines  | =org-mode=    |
-     | =elfeed-org= absent  | Elisp forms    | =emacs-lisp-mode= |
-
-  ** Org Format
-
-     - Level-2 heading (=**=) for "Translated feeds" group
-     - Level-3 headings (=***=) for individual feeds
-     - Uses org link syntax: =[[file:///...][[TL] Title]]=
-     - Properties drawer with =:ORIGINAL-FEED:= for traceability
-     - Drawers folded on initial display (=org-fold-hide-drawers-all=)
-
-     This format sits under the user's existing level-1 feed group in
-     their elfeed-org file.
-
-  ** Buffer Lifecycle
-
-     - Buffer name: =*elfeed-translate-feeds*=
-     - Always regenerated fresh (content is erased and rebuilt)
-     - RSS files are regenerated before displaying
-     - Read-only mode enabled after population
-
-* Known Bugs Fixed (Historical Record)
-
-  1. *JSON parse: hash-table vs alist* — =json-parse-string= ignores
-     dynamic variable =json-object-type= when ANY keyword argument is
-     passed.  Fix: always pass =:object-type 'alist= explicitly.
-
-  2. *batch chain deadlock* — =elfeed-translate--busy= was cleared in
- =unwind-protect= cleanup /after/ the callback.  The callback
-     triggers the next batch, which checks =busy= and skips.  Fix:
-     clear =busy= /before/ invoking the callback.
-
-  3. *=cl-return-from= failing* — =cl-return-from= inside
- =condition-case= error handler couldn't find the =cl-block=
-     established by =defun=.  Fix: replaced with explicit
- =catch='parse-error / =throw='parse-error=.
-
-  4. *Prompt template= *— 3 =%s= placeholders but =format= only got 1
-     argument.  Fix: reduced to 1 =%s= and used natural language for
-     remaining references.
-
-* Future Improvements (Ideas)
-
-  - *Cache key by entry GUID* instead of title string — more robust
-    against minor title changes (e.g., RSS feed adding/removing a
-    trailing space)
-  - *auto-refresh after translation* — call =elfeed-update-feed= on
-    local files with a timer without triggering recursive hooks
-  - *per-feed target language* — some feeds → English, others →
-    Chinese, controlled by a feed-level property
-  - *translation progress indicator* — show a progress bar or spinner
-    during batch processing
-  - *error retry* — retry failed batches with exponential backoff
-  - *streaming API support* — use SSE to get incremental results
-
-* Testing
-
-  Since this package interacts with external APIs and Elfeed's
-  database, testing is best done interactively:
-
-  1. =M-x eval-buffer= on =elfeed-translate.el=
-  2. =(setq elfeed-translate-debug t)=
-  3. =M-x elfeed= → verify "Setup — N feed(s), M cached" message
-  4. =M-x elfeed-translate-stats= → verify feeds and cache counts
-  5. =M-x elfeed-update= → observe batch processing in =*Messages*=
-  6. Verify =~/.elfeed/translated/*.xml= files are generated with
-     correct content
-  7. Run =elfeed-update= again → verify "All titles up to date"
-     (cache is working)
-
-* Dependencies
-
-  | Package     | Used For                                      |
-  |-------------+-----------------------------------------------|
-  | =elfeed=    | Feed database, entry structs, hooks           |
-  | =elfeed-db= | =elfeed-db-entries=, =elfeed-db-get-feed=     |
-  | =url=       | HTTP requests (=url-retrieve=)                 |
-  | =json=      | =json-parse-string=, =json-serialize=          |
-  | =xml=       | =xml-escape-string=                            |
-  | =subr-x=    | =string-trim=, =string-join=, =hash-table-p=   |
-  | =cl-lib=    | =cl-case=, =cl-pushnew=, =cl-incf=, etc.       |
-  | =seq=       | =seq-take=, =seq-filter=, =seq-count=           |
-
-  All are built into Emacs except =elfeed= (=Package-Requires=
-  handles it).
-
-* File Layout Convention
-
-  The file follows standard Emacs Lisp conventions:
-  - =lexical-binding: t= in the first line
-  - =Author=, =Version=, =Package-Requires=, =Keywords=, =URL= headers
-  - =;;; Commentary:= section
-  - =;;; Code:= section
-  - Sections separated by Unicode box-drawing headers (═)
-  - =provide= at the end
-  - =;;; elfeed-translate.el ends here= trailing comment
+* Scope and Design Invariants
+
+=elfeed-translate= is a single-file Emacs Lisp package that translates Elfeed
+entry titles and/or content through an OpenAI-compatible chat-completions API.
+It generates separate local RSS 2.0 feeds instead of mutating original entries.
+
+The following are intentional invariants:
+
+1. One installation has one global target language.
+2. Title and content translation are independently selected by feed tags.
+3. A translation is written only after an entire API batch is paired safely.
+4. Source feeds and their Elfeed database entries are never overwritten.
+5. Transport failures fail fast; only unusable translation results are retried.
+6. API credentials must never appear in package-generated diagnostics.
+
+Per-feed languages, runtime language switching, and language-aware cache keys
+are not current goals.  A deliberate target-language change requires an
+explicit cache clear.
+
+* Source Layout
+
+The project intentionally keeps all package code in =elfeed-translate.el=.
+
+| Section | Responsibility |
+|---------+----------------|
+| Customization | API, prompts, tags, batch sizes, concurrency, timeout and retry options |
+| SQLite Cache | Schema, migration, lookup and transactional writes |
+| Utilities | Feed mapping, content extraction, autotags and GUIDs |
+| RSS Generation | Local RSS 2.0 files and title formatting |
+| API Client | Request validation, HTTP transport, response parsing and diagnostics |
+| Core Collection | Find uncached title/content work |
+| Feed Display | Generate copyable local subscription definitions |
+| Dispatch | Serial/parallel queues, retry timers and finalization |
+| Public Commands | Setup, test, update, cache and statistics commands |
+| Global Mode | Install setup on =elfeed-search-mode-hook= |
+
+Dependencies are built into Emacs 29.1 except Elfeed: =url=, =json=, =sqlite=,
+=xml=, =subr-x=, =cl-lib= and =seq=.
+
+* End-to-End Lifecycle
+
+#+begin_src text
+global-elfeed-translate-mode
+  -> elfeed-search-mode-hook
+     -> elfeed-translate-setup
+        -> open/create SQLite cache
+        -> generate initial local RSS files
+        -> install elfeed update hooks
+
+elfeed-update
+  -> elfeed-update-init-hooks records expected feed count
+  -> elfeed-update-hooks counts completed feeds
+  -> elfeed-translate--on-all-feeds-updated
+     -> elfeed-translate--on-db-update
+        -> collect uncached title and content items
+        -> deduplicate source text
+        -> split title and content batches independently
+        -> merge them into one queue
+        -> serial or bounded-parallel dispatch
+        -> transactional cache write for every successful batch
+        -> regenerate affected local RSS files
+        -> optional guarded auto-refresh
+#+end_src
+
+The title queue uses =elfeed-translate-system-prompt= and
+=elfeed-translate-batch-size=.  The content queue uses the content prompt and
+content batch size.  Queue elements have this shape:
+
+#+begin_src elisp
+(:call-fn elfeed-translate--call-api
+ :texts ("source 1" "source 2")
+ :prompt PROMPT-TEMPLATE
+ :retries 0)
+#+end_src
+
+* Request Construction and Encoding
+
+=elfeed-translate--build-request= is the only production request builder.
+=elfeed-translate-test-api= calls the same builder and transport path.
+
+The builder:
+
+1. Assigns =item-0001=, =item-0002=, ... within each batch.
+2. Serializes the user message as an id-bearing JSON array.
+3. Embeds that text in the OpenAI chat-completions request object.
+4. Serializes and parses the outer JSON once as a validation step.
+5. Requires the final body to be a UTF-8 unibyte string.
+6. Trims, validates and converts the API key and all headers to ASCII unibyte.
+
+The header normalization is required by Emacs =url-http=.  A multibyte ASCII
+Authorization value combined with raw UTF-8 JSON can promote the complete HTTP
+request to a multibyte string; =url-http-create-request= rejects that request
+before it is sent.
+
+The request =Content-Type= is =application/json; charset=utf-8=.  Debug output
+may report byte counts and multibyte state but never the Authorization value.
+
+* Id-Bearing Batch Protocol
+
+Input is still ordinary text delivered in =messages[1].content=.  Its syntax is:
+
+#+begin_src json
+[
+  {"id":"item-0001","text":"source text"},
+  {"id":"item-0002","text":"another source"}
+]
+#+end_src
+
+Expected model output:
+
+#+begin_src json
+[
+  {"id":"item-0002","translation":"translated second item"},
+  {"id":"item-0001","translation":"translated first item"}
+]
+#+end_src
+
+Pairing is by id, not array position.  The parser requires every expected id
+exactly once and rejects unknown, missing and duplicate ids.  This makes model
+reordering harmless and allows source/translation text to contain =---=,
+quotes, newlines, backslashes or HTML without delimiter ambiguity.
+
+The parser accepts a top-level array and, defensively, an object containing a
+=translations= array.  It also removes a surrounding Markdown code fence.  If
+content is not JSON at all, the old =---= and line parsers run as compatibility
+fallbacks.  Valid JSON with invalid ids does not fall back: it is a protocol
+failure and is retried.
+
+* Structured API Results
+
+Callbacks receive a plist rather than a pairs-or-nil value.
+
+Success:
+
+#+begin_src elisp
+(:ok t
+ :pairs ((CACHE-KEY . "translation"))
+ :http-status 200
+ :finish-reason "stop"
+ :protocol id-json)
+#+end_src
+
+Failure:
+
+#+begin_src elisp
+(:ok nil
+ :kind output-mismatch
+ :message "Expected 10 translations, received 9"
+ :retryable t
+ :http-status 200
+ :finish-reason "stop")
+#+end_src
+
+The HTTP callback status plist is inspected before response parsing.  Timeout
+logic stores the buffer returned by =url-retrieve= immediately, so it can stop
+the process even before a response callback fires.  A shared =done= flag
+prevents late responses from invoking the batch callback twice.
+
+* finish_reason and Retry Classification
+
+=finish_reason= is recorded on both successful and failed results and displayed
+by the API test command.  Classification is intentionally biased toward fast
+failure for external transport state:
+
+| Condition | Retry? | Failure kind |
+|-----------+--------+--------------|
+| URL transport error, proxy/TLS failure, timeout, empty response | No | =network=, =timeout=, =empty-response= |
+| Any HTTP error, including 429 and 5xx | No | =http= |
+| Missing =choices[0].message.content= | No | =api-structure= |
+| HTTP 2xx response JSON cannot be parsed | Yes | =json= |
+| =finish_reason= =stop= or absent | Continue parsing | — |
+| =finish_reason= =length= or =max_tokens= | Yes | =completion-truncated= |
+| =finish_reason= =content_filter= or =safety= | No | =completion-filtered= |
+| Other non-stop finish reason | Yes | =completion-incomplete= |
+| Invalid id JSON, missing/duplicate/unknown id | Yes | =translation-json= |
+| Legacy output count mismatch | Yes | =output-mismatch= |
+
+This policy is not a general-purpose HTTP retry strategy.  It reflects the
+interactive feed workflow: return control quickly when the network/provider is
+unavailable, but give the model a limited chance to correct an otherwise valid
+translation request.
+
+Retryable failures use exponential backoff with up to 25 percent jitter.  The
+delay is capped by =elfeed-translate-retry-max-delay=.  Serial and parallel
+dispatchers both hold =elfeed-translate--busy= across delayed retries.
+
+Parallel state lives in =elfeed-translate--parallel-state=, including
+=:queue=, =:in-flight=, =:retry-waiting=, =:completed= and =:total=.  Delayed
+retries increment =:retry-waiting= so an empty queue cannot finalize early.
+Top-level callback/timer functions are used instead of self-referential local
+closures for reliable =eval-buffer= behavior.
+
+* SQLite Translation Cache
+
+The cache file is =~/.elfeed/translated/translate-cache.sqlite=.  Schema:
+
+#+begin_src sql
+CREATE TABLE translations (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+#+end_src
+
+=key= is =MD5(source-text)= and =value= is the raw translation.  This is
+consistent with the single-target-language invariant.  A target-language
+change without clearing the cache is unsupported.
+
+Each successful batch is written in one SQLite transaction.  Cache persistence
+is therefore incremental and crash-safe.  The legacy
+=translate-cache.el= hash table is migrated once and renamed with a
+=.migrated= suffix.
+
+Title display style is not part of the cache.  Formatting is applied when RSS
+is generated, so changing title order or separator only requires regeneration.
+
+* Local RSS Generation
+
+Each source URL maps to =MD5(feed-url).xml= under
+=elfeed-translate-output-dir=.  Item GUIDs use
+=MD5(feed-url):original-entry-id= to prevent collisions between local feeds.
+
+Title and content translations are read independently.  When a translation is
+not yet cached, generated entries retain the available original title/content
+instead of disappearing from the local feed.
+
+* Diagnostics
+
+=elfeed-translate-test-api= sends two titles through the full production path.
+Its report contains:
+
+- endpoint, model and target language;
+- JSON byte/multibyte and header checks;
+- HTTP status and elapsed time;
+- =finish_reason= and selected parser protocol;
+- source and translated text, or structured failure metadata;
+- a permanently redacted API key field.
+
+Failed raw responses are appended to =*elfeed-translate-debug*= with timestamp,
+reason and cache-key count.  HTTP provider error JSON is summarized when
+possible.
+
+* Critical Implementation Notes
+
+1. Always pass =:object-type=, =:array-type=, =:null-object= and
+   =:false-object= directly to =json-parse-string=.
+2. Clear a per-request busy lock before invoking the next callback; current
+   serial dispatch instead owns the busy lock for the complete cycle.
+3. Do not replace direct =url-retrieve= with =url-queue-retrieve=: delayed
+   execution loses dynamic request bindings.
+4. Preserve the timeout =done= guard to prevent double callbacks.
+5. The system prompt templates contain exactly one =%s= placeholder for the
+   global target language.
+6. Preserve id validation before cache writes.  Partial batches must never be
+   cached by position.
+7. Do not print or dump Authorization headers.
+
+* Validation
+
+There is no committed automated test suite.  Before releasing changes:
+
+1. Run =check-parens= or evaluate the source buffer.
+2. Byte-compile with Elfeed on =load-path=.
+3. Test request construction with a multibyte ASCII key and non-ASCII prompt.
+4. Exercise synthetic 200, malformed-id, truncated, 429 and network results.
+5. Exercise serial and parallel delayed retries and confirm the busy lock and
+   parallel state are cleared exactly once.
+6. Run =M-x elfeed-translate-test-api= against the configured provider.
+7. Run an Elfeed update twice and verify the second cycle is a cache hit.

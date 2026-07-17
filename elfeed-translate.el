@@ -1,7 +1,7 @@
 ;;; elfeed-translate.el --- Translate Elfeed entry titles and content via LLM API -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 ;; URL: https://github.com/pilrymage/elfeed-translate
@@ -48,6 +48,9 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'sqlite)
+
+(declare-function org-fold-hide-drawers-all "org-fold")
+(declare-function org-cycle-hide-drawers "org-cycle")
 
 ;; ═══════════════════════════════════════════════════════════════════════
 ;; Customization
@@ -126,27 +129,21 @@ Each configured feed gets its own file named <hash>.xml."
   (concat
    "You are a translator. Translate each RSS feed title below into %s.\n\n"
    "CRITICAL OUTPUT FORMAT:\n"
-   "- The input titles are separated by a line containing exactly \"---\"\n"
-   "- You must output exactly the same number of lines, "
-   "separated by lines containing exactly \"---\"\n"
-   "- Do NOT add numbers, bullets, quotes, or any introductory/concluding text\n"
-   "- Each output line must be ONLY the translated title\n\n"
+   "- The input is a JSON array of objects with \"id\" and \"text\" fields\n"
+   "- Return ONLY a valid JSON array; do not use Markdown code fences\n"
+   "- Each output object must contain the unchanged \"id\" and a \"translation\" field\n"
+   "- Return every input id exactly once; do not add, remove, or duplicate ids\n"
+   "- Output order may differ because results are matched by id\n\n"
    "TRANSLATION RULES:\n"
    "- Preserve: technical terms, proper nouns, brand names, URLs, emoji\n"
    "- If a title is already in the target language, output it unchanged\n"
    "- Translate the MEANING, not word-for-word; make it sound natural\n\n"
    "EXAMPLE INPUT:\n"
-   "Breaking News: OpenAI Announces GPT-5 Model\n"
-   "---\n"
-   "How to build a REST API with Flask\n"
-   "---\n"
-   "今日天气\n\n"
+   "[{\"id\":\"item-0001\",\"text\":\"Breaking News: OpenAI Announces GPT-5 Model\"},"
+   "{\"id\":\"item-0002\",\"text\":\"今日天气\"}]\n\n"
    "EXAMPLE OUTPUT:\n"
-   "突发新闻：OpenAI 发布 GPT-5 模型\n"
-   "---\n"
-   "如何使用 Flask 构建 REST API\n"
-   "---\n"
-   "今日天气")
+   "[{\"id\":\"item-0001\",\"translation\":\"突发新闻：OpenAI 发布 GPT-5 模型\"},"
+   "{\"id\":\"item-0002\",\"translation\":\"今日天气\"}]")
   "System prompt template for title translation.
 %s is replaced with `elfeed-translate-target-lang'."
   :type 'string
@@ -156,28 +153,24 @@ Each configured feed gets its own file named <hash>.xml."
   (concat
    "You are a translator. Translate each RSS feed content snippet below into %s.\n\n"
    "CRITICAL OUTPUT FORMAT:\n"
-   "- The input snippets are separated by a line containing exactly \"---\"\n"
-   "- You must output exactly the same number of snippets, "
-   "separated by lines containing exactly \"---\"\n"
-   "- Do NOT add numbers, bullets, quotes, or any introductory/concluding text\n"
-   "- Each output snippet must be ONLY the translated content\n\n"
+   "- The input is a JSON array of objects with \"id\" and \"text\" fields\n"
+   "- Return ONLY a valid JSON array; do not use Markdown code fences\n"
+   "- Each output object must contain the unchanged \"id\" and a \"translation\" field\n"
+   "- Return every input id exactly once; do not add, remove, or duplicate ids\n"
+   "- Output order may differ because results are matched by id\n\n"
    "TRANSLATION RULES:\n"
    "- Preserve all HTML tags as-is; only translate the text between tags\n"
    "- Preserve: technical terms, proper nouns, brand names, URLs, emoji, code blocks\n"
    "- If text is already in the target language, output it unchanged\n"
    "- Translate the MEANING, not word-for-word; make it sound natural\n\n"
    "EXAMPLE INPUT:\n"
-   "<p>OpenAI has announced the release of GPT-5.</p>\n"
-   "---\n"
-   "<p>This tutorial covers building REST APIs with Flask.</p>\n\n"
+   "[{\"id\":\"item-0001\",\"text\":\"<p>OpenAI has announced the release of GPT-5.</p>\"}]\n\n"
    "EXAMPLE OUTPUT:\n"
-   "<p>OpenAI 已发布 GPT-5 模型。</p>\n"
-   "---\n"
-   "<p>本教程介绍如何使用 Flask 构建 REST API。</p>")
+   "[{\"id\":\"item-0001\",\"translation\":\"<p>OpenAI 已发布 GPT-5 模型。</p>\"}]")
   "System prompt template for content translation.
 Used when feeds are tagged with `elfeed-translate-content-tag'.
 Each content snippet is treated as an independent translation unit,
-separated by \"---\".  %s is replaced with
+identified by its JSON id.  %s is replaced with
 `elfeed-translate-target-lang'."
   :type 'string
   :group 'elfeed-translate)
@@ -275,11 +268,27 @@ connection from blocking translation indefinitely.  Set to nil or
   :group 'elfeed-translate)
 
 (defcustom elfeed-translate-max-retries 3
-  "Maximum number of retry attempts for a failed API batch.
-When a batch fails (timeout, HTTP error, parse error), it is
-retried up to this many times before giving up.  Set to 0 to
-disable retries."
+  "Maximum retries for an unusable model translation result.
+Transport failures, timeouts and HTTP errors fail immediately.
+Malformed translation JSON, incomplete ids, output mismatches and
+retryable `finish_reason' values use this limit.  Set to 0 to
+disable all retries."
   :type 'integer
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-retry-base-delay 1.0
+  "Initial delay in seconds before retrying a failed API batch.
+Each subsequent retry doubles this delay, up to
+`elfeed-translate-retry-max-delay'.  A small random jitter is added
+to avoid immediately repeating requests alongside other clients."
+  :type 'number
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-retry-max-delay 30.0
+  "Maximum client-side delay in seconds between API retry attempts.
+Only translation-result failures are retried; transport and HTTP
+failures stop immediately."
+  :type 'number
   :group 'elfeed-translate)
 
 (defcustom elfeed-translate-auto-refresh nil
@@ -392,10 +401,10 @@ translations table.  After migration the old file is renamed to
                                (hash-table-count data) migrated)))
                 (message "[elfeed-translate] Legacy cache is not a hash-table, skipping migration")))
             ;; Discard any remaining unread data
-            nil))
+            nil)
       (error
        (message "[elfeed-translate] Migration failed: %s"
-                (error-message-string err))))))
+                (error-message-string err)))))))
 
 (defun elfeed-translate--load-cache ()
   "Open the SQLite cache database and initialise tables.
@@ -659,15 +668,130 @@ Prevents infinite recursion: when auto-refresh's update completes,
 `elfeed-translate--on-all-feeds-updated' does not start another
 translation cycle.")
 
+(defun elfeed-translate--success-result (pairs &rest metadata)
+  "Return a structured successful API result for PAIRS.
+METADATA is appended as plist entries such as :http-status."
+  (append (list :ok t :pairs pairs) metadata))
+
+(defun elfeed-translate--failure-result (kind message retryable &rest metadata)
+  "Return a structured failed API result.
+KIND identifies the failure stage, MESSAGE describes it, and
+RETRYABLE says whether retrying may succeed.  METADATA is appended
+as additional plist entries."
+  (append (list :ok nil
+                :kind kind
+                :message message
+                :retryable retryable)
+          metadata))
+
+(defun elfeed-translate--result-ok-p (result)
+  "Return non-nil when RESULT represents a successful API call."
+  (and result (plist-get result :ok)))
+
+(defun elfeed-translate--failure-summary (result)
+  "Return a concise human-readable summary of failed RESULT."
+  (let ((kind (plist-get result :kind))
+        (message-text (plist-get result :message))
+        (http-status (plist-get result :http-status)))
+    (string-join
+     (delq nil
+           (list (and kind (symbol-name kind))
+                 (and http-status (format "HTTP %d" http-status))
+                 message-text))
+     ": ")))
+
+(defun elfeed-translate--ascii-unibyte (string label &optional trim)
+  "Return STRING as an ASCII unibyte string.
+LABEL identifies the value in error messages.  When TRIM is
+non-nil, remove surrounding whitespace first."
+  (unless (stringp string)
+    (error "%s must be a string" label))
+  (let ((value (if trim (string-trim string) string)))
+    (when (and trim (string-empty-p value))
+      (error "%s is empty" label))
+    (unless (seq-every-p (lambda (char) (< char 128)) value)
+      (error "%s must contain ASCII characters only" label))
+    (encode-coding-string value 'us-ascii)))
+
+(defun elfeed-translate--batch-item-ids (count)
+  "Return COUNT stable item identifiers for one API batch."
+  (cl-loop for index from 1 to count
+           collect (format "item-%04d" index)))
+
+(defun elfeed-translate--batch-user-content (texts)
+  "Encode TEXTS as the id-bearing JSON array sent to the model.
+The returned value is a decoded multibyte Lisp string so the outer
+OpenAI request serializer can encode it exactly once."
+  (let* ((ids (elfeed-translate--batch-item-ids (length texts)))
+         (items
+          (vconcat
+           (cl-mapcar (lambda (id text)
+                        `((id . ,id) (text . ,text)))
+                      ids texts))))
+    (decode-coding-string (json-serialize items) 'utf-8)))
+
+(defun elfeed-translate--build-request (texts system-prompt)
+  "Build and validate the API request for TEXTS and SYSTEM-PROMPT.
+Returns a plist containing :keys, :data and :headers.  The JSON body
+is verified to be valid UTF-8 JSON in a unibyte string, and every
+HTTP header is normalised to ASCII unibyte form before Emacs' URL
+library concatenates it with the body."
+  (let* ((prompt-template (or system-prompt
+                              elfeed-translate-system-prompt))
+         (system-prompt-str (format prompt-template
+                                    elfeed-translate-target-lang))
+         (user-content (elfeed-translate--batch-user-content texts))
+         (keys (mapcar #'elfeed-translate--cache-key texts))
+         (request-object
+          `((model . ,elfeed-translate-model)
+            (messages . [((role . "system")
+                          (content . ,system-prompt-str))
+                         ((role . "user")
+                          (content . ,user-content))])
+            (temperature . ,elfeed-translate-temperature)))
+         (data (json-serialize request-object))
+         (api-key (elfeed-translate--ascii-unibyte
+                   elfeed-translate-api-key "API key" t)))
+    ;; `json-serialize' promises a UTF-8 unibyte string.  Validate both
+    ;; properties here because `url-http-create-request' rejects a request
+    ;; when any multibyte header promotes the raw JSON bytes to multibyte.
+    (when (multibyte-string-p data)
+      (setq data (encode-coding-string data 'utf-8)))
+    (unless (= (length data) (string-bytes data))
+      (error "Serialized JSON body is not a unibyte byte sequence"))
+    (condition-case err
+        (json-parse-string data
+                           :object-type 'alist
+                           :array-type 'list
+                           :null-object nil
+                           :false-object :json-false)
+      (error
+       (error "Serialized JSON body failed validation: %s"
+              (error-message-string err))))
+    (list
+     :keys keys
+     :data data
+     :headers
+     (list
+      (cons (elfeed-translate--ascii-unibyte "Content-Type" "header name")
+            (elfeed-translate--ascii-unibyte
+             "application/json; charset=utf-8" "Content-Type"))
+      (cons (elfeed-translate--ascii-unibyte "Accept" "header name")
+            (elfeed-translate--ascii-unibyte "application/json" "Accept"))
+      (cons (elfeed-translate--ascii-unibyte "Authorization" "header name")
+            (elfeed-translate--ascii-unibyte
+             (concat "Bearer " api-key) "Authorization"))))))
+
 (defun elfeed-translate--call-api (texts callback &optional no-busy-guard system-prompt)
   "Translate TEXTS (list of strings) via the configured LLM API.
-CALLBACK receives one argument: an alist of (cache-key . translated)
-pairs on success, or nil on failure.  cache-key is the MD5 of each
-input string.
+CALLBACK receives one structured result plist.  On success it has
+:ok t and :pairs containing (cache-key . translated) pairs.  On
+failure it has :ok nil plus :kind, :message and :retryable metadata.
+Each cache-key is the MD5 of its input string.
 
-The texts are sent as a single batch, separated by '---' markers.
-The API response is expected to contain translated texts separated
-by the same marker.
+The texts are sent as an id-bearing JSON array.  The API response is
+expected to return each id exactly once with its translation; legacy
+separator output remains a compatibility fallback.
 
 SYSTEM-PROMPT is the prompt template (with %s for target language).
 Defaults to `elfeed-translate-system-prompt'.
@@ -684,128 +808,147 @@ dynamic `url-request-method' / `url-request-extra-headers' /
   (cond
    ((and (not no-busy-guard) elfeed-translate--busy)
     (message "[elfeed-translate] API call already in progress, skipping")
-    (when callback (funcall callback nil)))
-   ((null elfeed-translate-api-key)
+    (when callback
+      (funcall callback
+               (elfeed-translate--failure-result
+                'busy "API call already in progress" nil))))
+   ((or (null elfeed-translate-api-key)
+        (and (stringp elfeed-translate-api-key)
+             (string-empty-p (string-trim elfeed-translate-api-key))))
     (message "[elfeed-translate] API key is not configured")
-    (when callback (funcall callback nil)))
+    (when callback
+      (funcall callback
+               (elfeed-translate--failure-result
+                'configuration "API key is not configured" nil))))
    ((null texts)
-    (when callback (funcall callback nil)))
+    (when callback
+      (funcall callback
+               (elfeed-translate--failure-result
+                'configuration "No input text was supplied" nil))))
    (t
     (unless no-busy-guard (setq elfeed-translate--busy t))
-    (let* ((prompt-template (or system-prompt
-                                elfeed-translate-system-prompt))
-           (system-prompt-str (format prompt-template
-                                      elfeed-translate-target-lang))
-           (user-content (string-join texts "\n---\n"))
-           ;; Pre-compute cache keys (MD5 of each input text)
-           (keys (mapcar #'elfeed-translate--cache-key texts))
-           (request-body
-            `((model . ,elfeed-translate-model)
-              (messages . [((role . "system")
-                            (content . ,system-prompt-str))
-                           ((role . "user")
-                            (content . ,user-content))])
-              (temperature . ,elfeed-translate-temperature)))
-           (url-request-method "POST")
-           (url-request-extra-headers
-            `(("Content-Type" . "application/json")
-              ("Authorization" . ,(concat "Bearer " elfeed-translate-api-key))))
-           (url-request-data (json-serialize request-body)))
-      (when elfeed-translate-debug
-        (message "[elfeed-translate] Sending API request:
+    (condition-case request-err
+        (let* ((request (elfeed-translate--build-request texts system-prompt))
+               (keys (plist-get request :keys))
+               (url-request-method "POST")
+               (url-request-extra-headers (plist-get request :headers))
+               (url-request-data (plist-get request :data)))
+          (when elfeed-translate-debug
+            (message "[elfeed-translate] Sending API request:
   URL   : %s
   Model : %s
   Items : %d
+  JSON  : %d bytes, multibyte=%s
   First : %s"
-                 elfeed-translate-api-url
-                 elfeed-translate-model
-                 (length texts)
-                 (if texts
-                     (substring (car texts) 0 (min 80 (length (car texts))))
-                   "N/A")))
-      (condition-case err
-          (let ((done nil)
-                (timeout-timer nil)
-                (response-buffer nil))
-            ;; Watchdog: if the response does not arrive within
-            ;; `elfeed-translate-request-timeout' seconds, mark the
-            ;; request done and invoke the callback with nil, preventing
-            ;; a stalled connection from leaving `--busy' set forever.
-            ;; The orphaned process (if any) is killed when its buffer
-            ;; is eventually garbage-collected; the response callback
-            ;; checks `done' and skips if the watchdog already fired.
-            (when (and elfeed-translate-request-timeout
-                       (> elfeed-translate-request-timeout 0))
-              (setq timeout-timer
-                    (run-at-time
-                     elfeed-translate-request-timeout nil
-                     (lambda ()
-                       (unless done
-                         (setq done t)
-                         (when (and response-buffer
-                                    (buffer-live-p response-buffer))
-                           (let ((proc (get-buffer-process response-buffer)))
-                             (when proc (delete-process proc))))
-                         (message
-                          "[elfeed-translate] Request timed out after %ds"
-                          elfeed-translate-request-timeout)
-                         (unless no-busy-guard
-                           (setq elfeed-translate--busy nil))
-                         (when callback (funcall callback nil)))))))
-            (funcall
-             #'url-retrieve
-             elfeed-translate-api-url
-             (lambda (_status)
-               ;; Record the response buffer so the watchdog can kill
-               ;; its process if it fires before we finish.
-               (setq response-buffer (current-buffer))
-               (if done
-                   ;; Watchdog already fired — discard this late response.
-                   (progn
-                     (when timeout-timer
-                       (cancel-timer timeout-timer)
-                       (setq timeout-timer nil)))
-                 (unwind-protect
-                     (let ((result
-                            (condition-case parse-err
-                                (elfeed-translate--parse-response
-                                 keys (current-buffer))
-                              (error
-                               (message
-                                "[elfeed-translate] Parse error: %s"
-                                (error-message-string parse-err))
-                               (elfeed-translate--dump-failed-response
-                                (current-buffer) keys
-                                (format "parse error: %s"
-                                        (error-message-string parse-err)))
-                               nil))))
-                       (setq done t)
-                       (when timeout-timer
-                         (cancel-timer timeout-timer)
-                         (setq timeout-timer nil))
-                       (unless no-busy-guard
-                         (setq elfeed-translate--busy nil))
-                       (when elfeed-translate-debug
-                         (message "[elfeed-translate] API response parsed: %s"
-                                  (if result
-                                      (format "%d pairs" (length result))
-                                    "FAILED")))
-                       (funcall callback result))
-                   ;; Safety net: if the callback throws, ensure busy is
-                   ;; still cleared so future updates are not permanently
-                   ;; blocked (serial mode).
-                   (unless done
-                     (when timeout-timer
-                       (cancel-timer timeout-timer)
-                       (setq timeout-timer nil)))
-                   (unless no-busy-guard
-                     (setq elfeed-translate--busy nil)))))
-             nil 'silent))
-        (error
-         (message "[elfeed-translate] Failed to send API request: %s"
-                  (error-message-string err))
+                     elfeed-translate-api-url
+                     elfeed-translate-model
+                     (length texts)
+                     (string-bytes url-request-data)
+                     (multibyte-string-p url-request-data)
+                     (if texts
+                         (substring (car texts) 0 (min 80 (length (car texts))))
+                       "N/A")))
+          (condition-case send-err
+              (let ((done nil)
+                    (timeout-timer nil)
+                    (response-buffer nil))
+                (when (and elfeed-translate-request-timeout
+                           (> elfeed-translate-request-timeout 0))
+                  (setq timeout-timer
+                        (run-at-time
+                         elfeed-translate-request-timeout nil
+                         (lambda ()
+                           (unless done
+                             (setq done t)
+                             (when (and response-buffer
+                                        (buffer-live-p response-buffer))
+                               (let ((proc (get-buffer-process response-buffer)))
+                                 (when proc (delete-process proc))))
+                             (message
+                              "[elfeed-translate] Request timed out after %ds"
+                              elfeed-translate-request-timeout)
+                             (unless no-busy-guard
+                               (setq elfeed-translate--busy nil))
+                             (when callback
+                               (funcall
+                                callback
+                                (elfeed-translate--failure-result
+                                 'timeout
+                                 (format "Request timed out after %ds"
+                                         elfeed-translate-request-timeout)
+                                 nil)))))))
+                ;; Save the buffer returned by `url-retrieve' immediately;
+                ;; the timeout can now terminate a request before its callback.
+                (setq
+                 response-buffer
+                 (url-retrieve
+                  elfeed-translate-api-url
+                  (lambda (status)
+                    (setq response-buffer (current-buffer))
+                    (if done
+                        (when timeout-timer
+                          (cancel-timer timeout-timer)
+                          (setq timeout-timer nil))
+                      (unwind-protect
+                          (let ((result
+                                 (if-let ((transport-error
+                                           (plist-get status :error)))
+                                     (elfeed-translate--failure-result
+                                      'network
+                                      (format "%S" transport-error)
+                                      nil
+                                      :transport-status status)
+                                   (condition-case parse-err
+                                       (elfeed-translate--parse-response
+                                        keys (current-buffer))
+                                     (error
+                                      (elfeed-translate--dump-failed-response
+                                       (current-buffer) keys
+                                       (format "parse error: %s"
+                                               (error-message-string parse-err)))
+                                      (elfeed-translate--failure-result
+                                       'parse
+                                       (error-message-string parse-err)
+                                       nil))))))
+                            (setq done t)
+                            (when timeout-timer
+                              (cancel-timer timeout-timer)
+                              (setq timeout-timer nil))
+                            (unless no-busy-guard
+                              (setq elfeed-translate--busy nil))
+                            (when elfeed-translate-debug
+                              (message
+                               "[elfeed-translate] API response: %s"
+                               (if (elfeed-translate--result-ok-p result)
+                                   (format "%d pairs"
+                                           (length (plist-get result :pairs)))
+                                 (elfeed-translate--failure-summary result))))
+                            (when callback (funcall callback result)))
+                        (unless done
+                          (when timeout-timer
+                            (cancel-timer timeout-timer)
+                            (setq timeout-timer nil)))
+                        (unless no-busy-guard
+                          (setq elfeed-translate--busy nil)))))
+                  nil 'silent))))
+            (error
+             (let ((result
+                    (elfeed-translate--failure-result
+                     'send (error-message-string send-err) nil)))
+               (message "[elfeed-translate] Failed to send API request: %s"
+                        (plist-get result :message))
+               (unless no-busy-guard (setq elfeed-translate--busy nil))
+               (when callback (funcall callback result))))))
+      (error
+       (let ((result
+              (elfeed-translate--failure-result
+               'request-validation
+               (error-message-string request-err)
+               nil)))
+         (message "[elfeed-translate] Request validation failed: %s"
+                  (plist-get result :message))
          (unless no-busy-guard (setq elfeed-translate--busy nil))
-         (funcall callback nil)))))))
+         (when callback (funcall callback result))))))))
 
 (defun elfeed-translate--extract-body (buffer)
   "Extract the HTTP response body from BUFFER, skipping headers.
@@ -844,6 +987,59 @@ Returns the body as a trimmed string."
     (when (re-search-forward "HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
       (string-to-number (match-string 1)))))
 
+(defun elfeed-translate--response-header (buffer name)
+  "Return HTTP response header NAME from BUFFER, or nil.
+Header matching is case-insensitive and stops at the end of the
+response header block."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-min))
+      (let ((case-fold-search t)
+            (end (or (and (re-search-forward "^\r?$" nil t)
+                          (match-beginning 0))
+                     (point-max))))
+        (goto-char (point-min))
+        (when (re-search-forward
+               (concat "^" (regexp-quote name) ":[ \t]*\\([^\r\n]*\\)")
+               end t)
+          (string-trim (match-string-no-properties 1)))))))
+
+(defun elfeed-translate--retry-after-seconds (buffer)
+  "Return Retry-After seconds from BUFFER for diagnostics, or nil.
+Both delta-seconds and HTTP-date forms are supported.  HTTP failures
+are not retried by the current policy."
+  (when-let ((value (elfeed-translate--response-header buffer "Retry-After")))
+    (cond
+     ((string-match-p "\\`[0-9]+\\'" value)
+      (string-to-number value))
+     (t
+      (condition-case nil
+          (max 0 (float-time
+                  (time-subtract (date-to-time value) (current-time))))
+        (error nil))))))
+
+(defun elfeed-translate--response-error-message (body)
+  "Extract a concise provider error message from response BODY."
+  (when (and body (not (string-empty-p body)))
+    (or
+     (condition-case nil
+         (let* ((data (json-parse-string body
+                                         :object-type 'alist
+                                         :array-type 'list
+                                         :null-object nil
+                                         :false-object :json-false))
+                (error-object (cdr (assoc 'error data))))
+           (cond
+            ((stringp error-object) error-object)
+            ((listp error-object)
+             (or (cdr (assoc 'message error-object))
+                 (format "%S" error-object)))
+            ((cdr (assoc 'message data)))
+            (t nil)))
+       (error nil))
+     (let ((one-line (replace-regexp-in-string "[\r\n]+" " " body)))
+       (substring one-line 0 (min 300 (length one-line)))))))
+
 (defun elfeed-translate--dump-failed-response (buffer keys reason)
   "Write the full raw content of BUFFER to a debug buffer for inspection.
 KEYS is the list of cache keys sent in the failed request.  REASON is a
@@ -870,31 +1066,184 @@ created or appended to, with a separator line between entries."
     (message "[elfeed-translate] Failed response dumped to *elfeed-translate-debug* (%s)"
              reason)))
 
+(defun elfeed-translate--strip-json-code-fence (content)
+  "Return CONTENT without a surrounding Markdown JSON code fence."
+  (let ((trimmed (string-trim content)))
+    (if (not (string-prefix-p "```" trimmed))
+        trimmed
+      (if-let ((newline (string-match "\n" trimmed)))
+          (let ((body (string-trim (substring trimmed (1+ newline)))))
+            (if (string-suffix-p "```" body)
+                (string-trim (string-remove-suffix "```" body))
+              body))
+        trimmed))))
+
+(defun elfeed-translate--finish-reason-failure (finish-reason http-status)
+  "Return a failure result for unsuccessful FINISH-REASON, or nil.
+HTTP-STATUS is attached as diagnostic metadata.  Missing finish
+reasons are accepted for compatibility with OpenAI-like providers
+that omit the field."
+  (let ((reason (and finish-reason
+                     (downcase (format "%s" finish-reason)))))
+    (cond
+     ((or (null reason) (string-empty-p reason) (equal reason "stop"))
+      nil)
+     ((member reason '("length" "max_tokens"))
+      (elfeed-translate--failure-result
+       'completion-truncated
+       (format "Model stopped before completing the batch (%s)" reason)
+       t :http-status http-status :finish-reason finish-reason))
+     ((member reason '("content_filter" "safety"))
+      (elfeed-translate--failure-result
+       'completion-filtered
+       (format "Model refused the batch (%s)" reason)
+       nil :http-status http-status :finish-reason finish-reason))
+     (t
+      (elfeed-translate--failure-result
+       'completion-incomplete
+       (format "Model did not finish with stop (%s)" reason)
+       t :http-status http-status :finish-reason finish-reason)))))
+
+(defun elfeed-translate--parse-id-json-content
+    (content keys http-status finish-reason)
+  "Parse id-bearing translation JSON CONTENT and pair it with KEYS.
+Returns nil only when CONTENT is not JSON, allowing the legacy parser
+to run.  Structurally invalid JSON returns a retryable failure result."
+  (let* ((candidate (elfeed-translate--strip-json-code-fence content))
+         (data
+          (condition-case nil
+              (json-parse-string candidate
+                                 :object-type 'alist
+                                 :array-type 'list
+                                 :null-object nil
+                                 :false-object :json-false)
+            (error :not-json))))
+    (unless (eq data :not-json)
+      (catch 'invalid-translation-json
+        (let* ((items
+                (cond
+                 ((and (listp data) (assoc 'translations data))
+                  (cdr (assoc 'translations data)))
+                 ((listp data) data)
+                 (t nil)))
+               (expected-ids
+                (elfeed-translate--batch-item-ids (length keys)))
+               (seen (make-hash-table :test 'equal))
+               (missing (make-symbol "missing")))
+          (unless (listp items)
+            (throw
+             'invalid-translation-json
+             (elfeed-translate--failure-result
+              'translation-json "Translation output is not a JSON array"
+              t :http-status http-status :finish-reason finish-reason)))
+          (dolist (item items)
+            (let ((id (and (listp item) (cdr (assoc 'id item))))
+                  (translation
+                   (and (listp item)
+                        (or (cdr (assoc 'translation item))
+                            (cdr (assoc 'text item))))))
+              (unless (and (stringp id)
+                           (stringp translation)
+                           (not (string-empty-p translation)))
+                (throw
+                 'invalid-translation-json
+                 (elfeed-translate--failure-result
+                  'translation-json
+                  "Every output item must contain string id and translation fields"
+                  t :http-status http-status :finish-reason finish-reason)))
+              (unless (member id expected-ids)
+                (throw
+                 'invalid-translation-json
+                 (elfeed-translate--failure-result
+                  'translation-json (format "Unknown translation id: %s" id)
+                  t :http-status http-status :finish-reason finish-reason)))
+              (unless (eq (gethash id seen missing) missing)
+                (throw
+                 'invalid-translation-json
+                 (elfeed-translate--failure-result
+                  'translation-json (format "Duplicate translation id: %s" id)
+                  t :http-status http-status :finish-reason finish-reason)))
+              (puthash id translation seen)))
+          (dolist (id expected-ids)
+            (when (eq (gethash id seen missing) missing)
+              (throw
+               'invalid-translation-json
+               (elfeed-translate--failure-result
+                'translation-json (format "Missing translation id: %s" id)
+                t :http-status http-status :finish-reason finish-reason))))
+          (elfeed-translate--success-result
+           (cl-mapcar (lambda (key id) (cons key (gethash id seen)))
+                      keys expected-ids)
+           :http-status http-status
+           :finish-reason finish-reason
+           :protocol 'id-json))))))
+
+(defun elfeed-translate--parse-legacy-content
+    (content keys http-status finish-reason)
+  "Parse legacy separator CONTENT as a compatibility fallback."
+  (let ((translated (split-string content "---" t "[ \t\n\r]+")))
+    (cond
+     ((= (length translated) (length keys))
+      (elfeed-translate--success-result
+       (cl-mapcar #'cons keys translated)
+       :http-status http-status :finish-reason finish-reason
+       :protocol 'legacy-separator))
+     (t
+      (let ((lines (split-string content "\n" t "\\s-*")))
+        (if (= (length lines) (length keys))
+            (elfeed-translate--success-result
+             (cl-mapcar #'cons keys lines)
+             :http-status http-status :finish-reason finish-reason
+             :protocol 'legacy-lines)
+          (elfeed-translate--failure-result
+           'output-mismatch
+           (format "Expected %d translations, received %d"
+                   (length keys) (length lines))
+           t :http-status http-status :finish-reason finish-reason)))))))
+
 (defun elfeed-translate--parse-response (keys buffer)
   "Parse the API response in BUFFER and pair with KEYS.
 KEYS is a list of MD5 cache-key strings in the same order as the
-texts sent.  Returns an alist of (key . translated) or nil on
-failure.  Uses catch/throw for early exit instead of cl-return-from
-to avoid issues with condition-case unwinding."
+texts sent.  Returns a structured success or failure result.  Uses
+catch/throw for early exit instead of cl-return-from to avoid issues
+with condition-case unwinding."
   (catch 'parse-error
-    ;; Early exit on HTTP errors — the body is likely an HTML error
-    ;; page, not JSON, so skip json-parse-string to avoid confusing
-    ;; parse-error messages.
-    (let ((http-status (elfeed-translate--http-status buffer)))
+    (let* ((http-status (elfeed-translate--http-status buffer))
+           (response-text (elfeed-translate--extract-body buffer)))
       (when (and http-status (>= http-status 400))
-        (message "[elfeed-translate] HTTP %d — skipping JSON parse" http-status)
-        (elfeed-translate--dump-failed-response
-         buffer keys (format "HTTP %d" http-status))
-        (throw 'parse-error nil)))
-    (let ((response-text (elfeed-translate--extract-body buffer)))
+        (let* ((provider-message
+                (elfeed-translate--response-error-message response-text))
+               (message-text
+                (if provider-message
+                    (format "Provider response: %s" provider-message)
+                  "Provider returned an HTTP error")))
+          (message "[elfeed-translate] HTTP %d: %s"
+                   http-status message-text)
+          (elfeed-translate--dump-failed-response
+           buffer keys (format "HTTP %d" http-status))
+          (throw
+           'parse-error
+           (elfeed-translate--failure-result
+            'http message-text nil
+            :http-status http-status
+            :retry-after (elfeed-translate--retry-after-seconds buffer)))))
       (unless response-text
         (message "[elfeed-translate] Empty response body")
-        (elfeed-translate--dump-failed-response buffer keys "empty body")
-        (throw 'parse-error nil))
+        (elfeed-translate--dump-failed-response
+         buffer keys "empty body")
+        (throw
+         'parse-error
+         (elfeed-translate--failure-result
+          'empty-response "Response body is missing" nil
+          :http-status http-status)))
       (when (string-empty-p response-text)
         (message "[elfeed-translate] Empty response body")
         (elfeed-translate--dump-failed-response buffer keys "empty body string")
-        (throw 'parse-error nil))
+        (throw
+         'parse-error
+         (elfeed-translate--failure-result
+          'empty-response "Response body is empty" nil
+          :http-status http-status)))
 
       ;; Parse JSON.  We pass :object-type / :array-type as keyword
       ;; arguments rather than relying on dynamic variable bindings,
@@ -902,28 +1251,26 @@ to avoid issues with condition-case unwinding."
       ;; json-parse-string to ignore the dynamic vars and use its
       ;; built-in defaults (hash-table / vector).
       (let* ((data
-              (condition-case _
+              (condition-case json-err
                   (json-parse-string response-text
                                      :object-type 'alist
                                      :array-type 'list
                                      :null-object nil
                                      :false-object :json-false)
                 (error
-                 ;; Retry with trailing content allowed
-                 (condition-case json-err
-                     (json-parse-string response-text
-                                        :object-type 'alist
-                                        :array-type 'list
-                                        :null-object nil
-                                        :false-object :json-false
-                                        :allow-trailing-content t)
-                   (error
-                    (message "[elfeed-translate] JSON parse error: %s"
-                             (error-message-string json-err))
-                    (elfeed-translate--dump-failed-response
-                     buffer keys (format "JSON parse: %s"
-                                         (error-message-string json-err)))
-                    (throw 'parse-error nil)))))))
+                 (message "[elfeed-translate] JSON parse error: %s"
+                          (error-message-string json-err))
+                 (elfeed-translate--dump-failed-response
+                  buffer keys (format "JSON parse: %s"
+                                      (error-message-string json-err)))
+                 (throw
+                  'parse-error
+                  (elfeed-translate--failure-result
+                   'json
+                   (format "Invalid JSON response: %s"
+                           (error-message-string json-err))
+                   t
+                   :http-status http-status))))))
         (when elfeed-translate-debug
           (message "[elfeed-translate] Parsed JSON keys: %s"
                    (mapcar #'car data)))
@@ -932,7 +1279,8 @@ to avoid issues with condition-case unwinding."
         (let* ((choices (cdr (assoc 'choices data)))
                (first-choice (car choices))
                (message-obj (cdr (assoc 'message first-choice)))
-               (content (cdr (assoc 'content message-obj))))
+               (content (cdr (assoc 'content message-obj)))
+               (finish-reason (cdr (assoc 'finish_reason first-choice))))
           (unless content
             ;; Log the full response structure for debugging
             (message
@@ -942,25 +1290,23 @@ to avoid issues with condition-case unwinding."
              (if message-obj (mapcar #'car message-obj) "missing"))
             (elfeed-translate--dump-failed-response
              buffer keys "unexpected API structure")
-            (throw 'parse-error nil))
-
-          ;; Split the translated content by the batch separator
-          (let ((translated (split-string content "---" t "[ \t\n\r]+")))
-            (if (= (length translated) (length keys))
-                (cl-mapcar #'cons keys translated)
-              (message
-               (concat "[elfeed-translate] Count mismatch: "
-                       "expected %d, got %d (%s). "
-                       "Falling back to line-by-line parsing.")
-               (length keys) (length translated)
-               (mapconcat #'identity translated " | "))
-              ;; Fallback: split by newlines
-              (let ((lines (split-string content "\n" t "\\s-*")))
-                (if (= (length lines) (length keys))
-                    (cl-mapcar #'cons keys lines)
-                  (message "[elfeed-translate] Line count still mismatched: %d vs %d"
-                           (length keys) (length lines))
-                  nil)))))))))
+            (throw
+             'parse-error
+             (elfeed-translate--failure-result
+              'api-structure
+              "Response is missing choices[0].message.content"
+              nil
+              :http-status http-status)))
+          (when elfeed-translate-debug
+            (message "[elfeed-translate] finish_reason=%S" finish-reason))
+          (when-let ((finish-failure
+                      (elfeed-translate--finish-reason-failure
+                       finish-reason http-status)))
+            (throw 'parse-error finish-failure))
+          (or (elfeed-translate--parse-id-json-content
+              content keys http-status finish-reason)
+              (elfeed-translate--parse-legacy-content
+               content keys http-status finish-reason)))))))
 
 ;; ═══════════════════════════════════════════════════════════════════════
 ;; Core Translation Logic
@@ -1120,13 +1466,33 @@ Tracks how many batches have completed (including retries exhausted)
 so that batch numbers stay consistent across retries.  Reset to nil
 when the cycle finishes.")
 
+(defvar elfeed-translate--serial-total nil
+  "Total number of original batches in the active serial cycle.")
+
+(defun elfeed-translate--retry-delay (result retries)
+  "Return retry delay in seconds for RESULT after RETRIES failures.
+Uses exponential backoff with jitter.  RESULT is accepted for the
+dispatcher interface; only its :retryable classification is used by
+the caller."
+  (ignore result)
+  (let* ((base (max 0.0 (float elfeed-translate-retry-base-delay)))
+         (maximum (max base (float elfeed-translate-retry-max-delay)))
+         (backoff (min maximum (* base (expt 2 retries))))
+         (jitter (* backoff (/ (random 1000) 4000.0))))
+    (+ backoff jitter)))
+
 (defun elfeed-translate--process-batches (queue affected-feeds)
   "Process QUEUE sequentially, one API call per batch.
 QUEUE is a list of plists: (:call-fn :texts :prompt :retries).
 AFFECTED-FEEDS is a list of feed URLs to regenerate on completion.
 Failed batches are re-enqueued with an incremented :retries counter,
-up to `elfeed-translate-max-retries' attempts."
+up to `elfeed-translate-max-retries' attempts.  Only failures marked
+:retryable are retried, after exponential backoff."
   (when queue
+    (unless elfeed-translate--serial-total
+      (setq elfeed-translate--serial-total (length queue))
+      (setq elfeed-translate--serial-completed 0)
+      (setq elfeed-translate--busy t))
     (let* ((element (car queue))
            (remaining (cdr queue))
            (call-fn (plist-get element :call-fn))
@@ -1134,93 +1500,123 @@ up to `elfeed-translate-max-retries' attempts."
            (prompt (plist-get element :prompt))
            (retries (plist-get element :retries))
            (done (or elfeed-translate--serial-completed 0))
-           (total (+ (length queue) done))
+           (total elfeed-translate--serial-total)
            (batch-num (1+ done)))
       (message "[elfeed-translate] Batch %d/%d: translating %d items..."
                batch-num total (length texts))
       (funcall
        call-fn
        texts
-       (lambda (pairs)
-         (if pairs
+       (lambda (result)
+         (let ((retry-scheduled nil))
+           (if (elfeed-translate--result-ok-p result)
              (progn
-               (elfeed-translate--cache-set-batch pairs)
-               (message "[elfeed-translate] Batch %d/%d: %d ok"
-                        batch-num total (length pairs))
+               (let ((pairs (plist-get result :pairs)))
+                 (elfeed-translate--cache-set-batch pairs)
+                 (message "[elfeed-translate] Batch %d/%d: %d ok"
+                          batch-num total (length pairs)))
                (setq elfeed-translate--serial-completed
                      (1+ (or elfeed-translate--serial-completed 0))))
-           ;; Failed — retry or give up
-           (if (< retries elfeed-translate-max-retries)
-               (progn
-                 (message
-                  "[elfeed-translate] Batch %d/%d: FAILED, will retry (%d/%d)..."
-                  batch-num total (1+ retries) elfeed-translate-max-retries)
-                 (setq remaining
-                       (append remaining
-                               (list (plist-put
-                                      (copy-sequence element)
-                                      :retries (1+ retries))))))
-             (message "[elfeed-translate] Batch %d/%d: FAILED (retries exhausted)"
-                      batch-num total)
-             (setq elfeed-translate--serial-completed
-                   (1+ (or elfeed-translate--serial-completed 0)))))
-         (if remaining
-             (elfeed-translate--process-batches remaining affected-feeds)
-           (setq elfeed-translate--serial-completed nil)
-           (elfeed-translate--finalize affected-feeds)))
-       nil  ; no-busy-guard
+             (if (and (plist-get result :retryable)
+                      (< retries elfeed-translate-max-retries))
+                 (let* ((delay (elfeed-translate--retry-delay result retries))
+                        (retry-element
+                         (plist-put (copy-sequence element)
+                                    :retries (1+ retries))))
+                   (setq retry-scheduled t)
+                   (message
+                    (concat "[elfeed-translate] Batch %d/%d: %s; "
+                            "retry %d/%d in %.1fs")
+                    batch-num total
+                    (elfeed-translate--failure-summary result)
+                    (1+ retries) elfeed-translate-max-retries delay)
+                   (run-at-time
+                    delay nil #'elfeed-translate--process-batches
+                    (cons retry-element remaining) affected-feeds))
+               (message
+                "[elfeed-translate] Batch %d/%d: FAILED, not retrying: %s"
+                batch-num total (elfeed-translate--failure-summary result))
+               (setq elfeed-translate--serial-completed
+                     (1+ (or elfeed-translate--serial-completed 0)))))
+           (unless retry-scheduled
+             (if remaining
+                 (elfeed-translate--process-batches remaining affected-feeds)
+               (setq elfeed-translate--serial-completed nil)
+               (setq elfeed-translate--serial-total nil)
+               (setq elfeed-translate--busy nil)
+               (elfeed-translate--finalize affected-feeds)))))
+       t  ; cycle-level busy guard is managed by this dispatcher
        prompt))))
 
 (defvar elfeed-translate--parallel-state nil
   "Plist holding parallel-dispatch state between async callbacks.
-Keys: :queue, :in-flight, :completed, :total, :max-concurrent,
-:finalize-fn.  Queue elements are plists:
+Keys: :queue, :in-flight, :retry-waiting, :completed, :total,
+:max-concurrent, :finalize-fn.  Queue elements are plists:
 (:call-fn :texts :prompt :retries).  Bound by
 `elfeed-translate--process-batches-parallel' and read by
 `elfeed-translate--parallel-dispatch' and
 `elfeed-translate--parallel-callback'.")
 
-(defun elfeed-translate--parallel-callback (element pairs)
+(defun elfeed-translate--parallel-maybe-finalize (state)
+  "Finalize parallel STATE when no queued, active or delayed work remains."
+  (when (and (eq state elfeed-translate--parallel-state)
+             (null (plist-get state :queue))
+             (= (plist-get state :in-flight) 0)
+             (= (plist-get state :retry-waiting) 0))
+    (funcall (plist-get state :finalize-fn))))
+
+(defun elfeed-translate--parallel-requeue-retry (state element)
+  "Put delayed retry ELEMENT back into parallel STATE's queue."
+  (when (eq state elfeed-translate--parallel-state)
+    (plist-put state :retry-waiting
+               (max 0 (1- (plist-get state :retry-waiting))))
+    (plist-put state :queue
+               (append (plist-get state :queue) (list element)))
+    (elfeed-translate--parallel-dispatch)
+    (elfeed-translate--parallel-maybe-finalize state)))
+
+(defun elfeed-translate--parallel-callback (element result)
   "Completion callback for one parallel API batch.
-ELEMENT is the queue plist that was dispatched.  PAIRS is non-nil
-on success, nil on failure.  On success, caches results.  On
-failure with retries remaining, re-enqueues ELEMENT with
-incremented :retries.  Then dispatches next batches and finalises
-when the queue is drained and nothing is in flight."
+ELEMENT is the queue plist that was dispatched.  RESULT is a
+structured API result.  Retryable failures are scheduled with
+backoff; deterministic failures are not retried."
   (let* ((state elfeed-translate--parallel-state)
          (completed (plist-get state :completed))
          (total (plist-get state :total))
-         (finalize-fn (plist-get state :finalize-fn))
          (retries (plist-get element :retries)))
     (unwind-protect
         (progn
           (plist-put state :in-flight (1- (plist-get state :in-flight)))
-          (if pairs
-              (progn
+          (if (elfeed-translate--result-ok-p result)
+              (let ((pairs (plist-get result :pairs)))
                 (elfeed-translate--cache-set-batch pairs)
                 (plist-put state :completed (1+ completed))
                 (message
                  "[elfeed-translate] Batch completed: %d ok (%d/%d)"
                  (length pairs) (1+ completed) total))
             ;; Failed — retry or give up
-            (if (< retries elfeed-translate-max-retries)
-                (progn
-                  (plist-put state :queue
-                             (append (plist-get state :queue)
-                                     (list (plist-put
-                                            (copy-sequence element)
-                                            :retries (1+ retries)))))
+            (if (and (plist-get result :retryable)
+                     (< retries elfeed-translate-max-retries))
+                (let* ((delay (elfeed-translate--retry-delay result retries))
+                       (retry-element
+                        (plist-put (copy-sequence element)
+                                   :retries (1+ retries))))
+                  (plist-put state :retry-waiting
+                             (1+ (plist-get state :retry-waiting)))
                   (message
-                   "[elfeed-translate] Batch FAILED, will retry (%d/%d) (%d pending)"
-                   (1+ retries) elfeed-translate-max-retries
-                   (length (plist-get state :queue))))
+                   (concat "[elfeed-translate] Batch failed: %s; "
+                           "retry %d/%d in %.1fs")
+                   (elfeed-translate--failure-summary result)
+                   (1+ retries) elfeed-translate-max-retries delay)
+                  (run-at-time
+                   delay nil #'elfeed-translate--parallel-requeue-retry
+                   state retry-element))
               (plist-put state :completed (1+ completed))
-              (message "[elfeed-translate] Batch FAILED (%d/%d)"
-                       (1+ completed) total))))
+              (message "[elfeed-translate] Batch FAILED (%d/%d), not retrying: %s"
+                       (1+ completed) total
+                       (elfeed-translate--failure-summary result)))))
       (elfeed-translate--parallel-dispatch)
-      (when (and (null (plist-get state :queue))
-                 (= (plist-get state :in-flight) 0))
-        (funcall finalize-fn)))))
+      (elfeed-translate--parallel-maybe-finalize state))))
 
 (defun elfeed-translate--parallel-dispatch ()
   "Dispatch pending batches up to the concurrency limit.
@@ -1231,8 +1627,7 @@ element to `elfeed-translate--parallel-callback' via a closure."
   (let* ((state elfeed-translate--parallel-state)
          (queue (plist-get state :queue))
          (in-flight (plist-get state :in-flight))
-         (max-concurrent (plist-get state :max-concurrent))
-         (total (plist-get state :total)))
+         (max-concurrent (plist-get state :max-concurrent)))
     (while (and queue (< in-flight max-concurrent))
       (let* ((element (pop queue)))
         (plist-put state :queue queue)
@@ -1247,8 +1642,8 @@ element to `elfeed-translate--parallel-callback' via a closure."
            (length texts) retries (length queue))
           (funcall call-fn
                    texts
-                   (lambda (pairs)
-                     (elfeed-translate--parallel-callback element pairs))
+                   (lambda (result)
+                     (elfeed-translate--parallel-callback element result))
                    t   ; no-busy-guard
                    prompt))))))
 
@@ -1272,6 +1667,7 @@ invoked from process filters (async callbacks)."
     (setq elfeed-translate--parallel-state
           (list :queue (copy-sequence queue)
                 :in-flight 0
+                :retry-waiting 0
                 :completed 0
                 :total (length queue)
                 :max-concurrent (max 1 elfeed-translate-max-concurrent)
@@ -1294,15 +1690,15 @@ and the total to the number of feeds in `elfeed-feeds'."
     (message "[elfeed-translate] Feed update started — %d feed(s) pending"
              elfeed-translate--feed-update-total)))
 
-(defun elfeed-translate--on-feed-updated (_url)
+(defun elfeed-translate--on-feed-updated (url)
   "Handle `elfeed-update-hooks': increment the completion counter.
-URL is the feed that just finished (ignored).  When the counter
+URL is the feed that just finished.  When the counter
 reaches the total, calls `elfeed-translate--on-all-feeds-updated'."
   (cl-incf elfeed-translate--feed-update-completed)
   (when elfeed-translate-debug
     (message "[elfeed-translate] Feed updated (%d/%d): %s"
              elfeed-translate--feed-update-completed
-             elfeed-translate--feed-update-total _url))
+             elfeed-translate--feed-update-total url))
   (when (>= elfeed-translate--feed-update-completed
             elfeed-translate--feed-update-total)
     (elfeed-translate--on-all-feeds-updated)))
@@ -1443,9 +1839,9 @@ Translation is triggered after ALL feeds finish updating (via
 
 ;;;###autoload
 (defun elfeed-translate-update ()
-  "Manually trigger translation of all tagged feed entries.
-Useful for re-translating after changing the target language or
-system prompt."
+  "Manually translate uncached entries from all tagged feeds.
+Cached entries remain unchanged.  Use `elfeed-translate-clear-cache'
+first only when an explicit full retranslation is intended."
   (interactive)
   (unless (elfeed-translate--translatable-feeds)
     (user-error "No feeds tagged with `%s' or `%s' in `elfeed-feeds'"
@@ -1458,7 +1854,7 @@ system prompt."
 (defun elfeed-translate-clear-cache ()
   "Clear all cached translations and regenerate RSS files.
 Use this when you want to force a fresh translation of all content
-(with a new target language, for example)."
+or deliberately replace the installation's single target language."
   (interactive)
   (when (yes-or-no-p "Clear all cached translations and re-translate everything? ")
     (elfeed-translate--cache-clear)
@@ -1469,52 +1865,94 @@ Use this when you want to force a fresh translation of all content
 
 ;;;###autoload
 (defun elfeed-translate-test-api ()
-  "Send a minimal test request to the configured API and show the response.
-Sends a single \"Hello\" prompt to `elfeed-translate-api-url' using
-`elfeed-translate-model' and displays the full HTTP response (headers
-+ body) in a pop-up buffer.  Use this to verify that the API key,
-endpoint, and model name are correct before running a full translation.
-
-The request uses the same `url-retrieve' path as real translation
-calls, so it exercises the actual request construction code."
+  "Test the complete configured title-translation pipeline.
+Sends two English titles through the same request builder, transport,
+response parser and id-bearing JSON protocol used by normal translation.
+Displays a structured, credential-safe report containing request
+encoding information, HTTP metadata and translated results."
   (interactive)
-  (unless elfeed-translate-api-key
+  (when elfeed-translate--busy
+    (user-error "A translation cycle is already active"))
+  (unless (and (stringp elfeed-translate-api-key)
+               (not (string-empty-p (string-trim
+                                     elfeed-translate-api-key))))
     (user-error "Set `elfeed-translate-api-key' first"))
-  (let* ((system-prompt (format elfeed-translate-system-prompt
-                                elfeed-translate-target-lang))
-         (request-body
-          `((model . ,elfeed-translate-model)
-            (messages . [((role . "system")
-                          (content . ,system-prompt))
-                         ((role . "user")
-                          (content . "Hello"))])
-            (temperature . ,elfeed-translate-temperature)))
-         (url-request-method "POST")
-         (url-request-extra-headers
-          `(("Content-Type" . "application/json")
-            ("Authorization" . ,(concat "Bearer " elfeed-translate-api-key))))
-         (url-request-data (json-serialize request-body)))
-    (message "[elfeed-translate] Sending test request to %s (model: %s)..."
-             elfeed-translate-api-url elfeed-translate-model)
-    (condition-case err
-        (url-retrieve
-         elfeed-translate-api-url
-         (lambda (_status)
-           (let ((raw (buffer-substring (point-min) (point-max))))
-             (with-current-buffer
-                 (get-buffer-create "*elfeed-translate-api-test*")
-               (let ((inhibit-read-only t))
-                 (erase-buffer)
-                 (insert raw)
-                 (goto-char (point-min)))
-               (read-only-mode 1)
-               (pop-to-buffer (current-buffer)))
-             (message "[elfeed-translate] Test response received (%d bytes)"
-                      (length raw))))
-         nil 'silent)
-      (error
-       (message "[elfeed-translate] Test request failed: %s"
-                (error-message-string err))))))
+  (let* ((texts '("OpenAI releases a new model for developers"
+                  "How to build a reliable RSS reader"))
+         (started-at (float-time))
+         (preflight
+          (condition-case err
+              (elfeed-translate--build-request
+               texts elfeed-translate-system-prompt)
+            (error
+             (user-error "Request preflight failed: %s"
+                         (error-message-string err)))))
+         (json-data (plist-get preflight :data))
+         (headers (plist-get preflight :headers)))
+    (message
+     "[elfeed-translate] Testing translation via %s (model: %s)..."
+     elfeed-translate-api-url elfeed-translate-model)
+    (elfeed-translate--call-api
+     texts
+     (lambda (result)
+       (let ((elapsed (- (float-time) started-at))
+             (buffer (get-buffer-create "*elfeed-translate-api-test*")))
+         (with-current-buffer buffer
+           (let ((inhibit-read-only t))
+             (erase-buffer)
+             (insert "elfeed-translate API translation test\n")
+             (insert "=====================================\n\n")
+             (insert (format "Endpoint       : %s\n"
+                             elfeed-translate-api-url))
+             (insert (format "Model          : %s\n"
+                             elfeed-translate-model))
+             (insert (format "Target language: %s\n"
+                             elfeed-translate-target-lang))
+             (insert (format "Elapsed        : %.2fs\n" elapsed))
+             (insert (format "JSON bytes     : %d\n"
+                             (string-bytes json-data)))
+             (insert (format "JSON multibyte : %s\n"
+                             (multibyte-string-p json-data)))
+             (insert (format "Headers ASCII  : %s\n"
+                             (seq-every-p
+                              (lambda (header)
+                                (and (not (multibyte-string-p (car header)))
+                                     (not (multibyte-string-p (cdr header)))))
+                              headers)))
+             (insert "API key        : <redacted>\n")
+             (insert (format "HTTP status    : %s\n"
+                             (or (plist-get result :http-status) "N/A")))
+             (insert (format "Finish reason  : %s\n"
+                             (or (plist-get result :finish-reason) "N/A")))
+             (insert (format "Output protocol: %s\n"
+                             (or (plist-get result :protocol) "N/A")))
+             (insert (format "Result         : %s\n\n"
+                             (if (elfeed-translate--result-ok-p result)
+                                 "SUCCESS"
+                               "FAILED")))
+             (if (elfeed-translate--result-ok-p result)
+                 (cl-mapc
+                  (lambda (source pair)
+                    (insert (format "Source      : %s\n" source))
+                    (insert (format "Translation : %s\n\n" (cdr pair))))
+                  texts (plist-get result :pairs))
+               (insert (format "Failure kind   : %s\n"
+                               (or (plist-get result :kind) "unknown")))
+               (insert (format "Retryable      : %s\n"
+                               (plist-get result :retryable)))
+               (insert (format "Message        : %s\n"
+                               (or (plist-get result :message)
+                                   "No diagnostic message"))))
+             (goto-char (point-min)))
+           (special-mode))
+         (pop-to-buffer buffer)
+         (message "[elfeed-translate] Translation test %s (%.2fs)"
+                  (if (elfeed-translate--result-ok-p result)
+                      "succeeded"
+                    "failed")
+                  elapsed)))
+     nil
+     elfeed-translate-system-prompt)))
 
 ;;;###autoload
 (defun elfeed-translate-stats ()

@@ -1,270 +1,139 @@
 # AGENTS.md
 
-Guide for AI agents working in the `elfeed-translate` repository.
+Guide for AI agents working in `elfeed-translate`.
 
-## Project Type
+## Project
 
-Single-file Emacs Lisp package (`elfeed-translate.el`, ~920 lines) that
-translates [Elfeed](https://github.com/skeeto/elfeed) RSS entry titles via any
-OpenAI-compatible LLM API. It generates local RSS 2.0 XML files as *separate
-subscription sources* so original feeds stay untouched and Elfeed's database
-avoids duplicate-entry collisions.
+`elfeed-translate.el` is a single-file Emacs Lisp package that translates
+Elfeed entry titles and/or content through an OpenAI-compatible
+`/chat/completions` API. It writes separate local RSS 2.0 feeds so original
+subscriptions and Elfeed entries remain untouched.
 
-- Emacs ≥ 27.1, Elfeed ≥ 3.0 (see `Package-Requires` header).
-- Lexical binding (`lexical-binding: t`).
-- No build system, no test suite, no CI, no Makefile. Testing is interactive
-  (see **Testing** below).
-- Documentation lives in `README.org` (user-facing) and `DEVELOPER.org`
-  (architecture, data flow, historical bugs). **Read `DEVELOPER.org` first**
-  before making non-trivial changes — it contains the full function call graph,
-  data-flow diagram, and a record of subtle bugs that were fixed.
+- Emacs >= 29.1, Elfeed >= 3.0.
+- Lexical binding is enabled.
+- SQLite stores translations incrementally.
+- There is no build system, committed test suite, CI, or Makefile.
+- `README.org` is user-facing; `DEVELOPER.org` is the authoritative architecture
+  and protocol document. Read `DEVELOPER.org` before non-trivial changes.
+
+The single-file layout is intentional. Do not split the package unless the user
+explicitly requests it.
+
+## Design Invariants
+
+1. One installation has one global target language. Per-feed language and
+   runtime language switching are out of scope. A deliberate language change
+   requires an explicit cache clear.
+2. Title and content translation are independent feed-tag capabilities.
+3. Batch input/output uses id-bearing JSON. Every expected id must occur exactly
+   once before any result is cached.
+4. Transport and HTTP failures, including 429, fail fast. Only validly delivered
+   requests with unusable translation results are retried.
+5. API credentials must never be logged or written to diagnostic buffers.
 
 ## Repository Layout
 
-```
-elfeed-translate.el   — the entire package (all logic, no submodules)
-README.org            — user docs (install, config, commands, how-it-works)
-DEVELOPER.org         — developer docs (architecture, gotchas, call graph)
-LICENSE               — GPL-3.0-or-later
-screenshots/display.png
-```
-
-There is exactly one source file. Do not split it unless explicitly asked;
-the single-file layout is intentional and follows Emacs Lisp package
-conventions.
-
-## Essential Commands
-
-There are no CLI build/test/lint commands. All work happens inside Emacs.
-
-- Load/evaluate: `M-x eval-buffer` on `elfeed-translate.el`, or
-  `eval-last-sexp` on the `(provide ...)` form.
-- Byte-compile check (optional, catches warnings): `M-x emacs-lisp-byte-compile`
-  on the buffer, or `emacs --batch -f batch-byte-compile elfeed-translate.el`
-  from a shell if you have Emacs on PATH.
-- Package-lint (if available): `M-x package-lint-current-buffer`.
-
-### Interactive Testing (the only test method)
-
-Per `DEVELOPER.org`:
-
-1. `M-x eval-buffer` on `elfeed-translate.el`
-2. `(setq elfeed-translate-debug t)` — enables detailed API request/response
-   logging to `*Messages*`
-3. `M-x elfeed` — verify the "Setup — N feed(s), M cached" message appears
-4. `M-x elfeed-translate-stats` — verify feed list and cache counts
-5. `M-x elfeed-update` — observe batch processing in `*Messages*`
-6. Inspect `~/.elfeed/translated/*.xml` for correct generated content
-7. `M-x elfeed-update` again — must report "All titles up to date" (cache hit)
-
-There is no mock/stub harness. To test without real API calls you must set
-`elfeed-translate-api-key` to a real OpenAI-compatible key (or point
-`elfeed-translate-api-url` at a local LLM server).
-
-## Architecture (summary — see DEVELOPER.org for full detail)
-
-Sections in `elfeed-translate.el`, in file order:
-
-| Section | Purpose |
-|---|---|
-| Customization (~42–191) | `defgroup` + 16 `defcustom` options (incl. parallel & timeout) |
-| Translation Cache (~175–229) | Hash table with disk persistence |
-| Utility Functions (~230–298) | Feed hashing, file paths, GUID gen, autotag helpers |
-| RSS XML Generation (~299–370) | RSS 2.0 output + title formatting |
-| API Client (~371–540) | HTTP request/response, JSON parse, batch translation, timeout watchdog |
-| Core Translation (~563–578) | Collect untranslated titles across tagged feeds |
-| Feed List Display (~579–665) | `show-feeds` buffer (org or Elisp format) |
-| DB Update Handler (~666–871) | Hook integration, batch split, serial & parallel dispatch |
-| Public Commands (~752–888) | `setup`, `teardown`, `update`, `clear-cache`, `stats` |
-| Global Minor Mode (~889–915) | `global-elfeed-translate-mode` + `elfeed-search-mode-hook` |
-
-### Control / data flow
-
-```
-M-x elfeed → elfeed-search-mode-hook → elfeed-translate-setup()
-  (idempotent; first call loads cache + generates initial RSS, then
-   adds #'elfeed-translate--on-db-update to elfeed-db-update-hook)
-
-M-x elfeed-update → Elfeed fetches feeds → entries added to elfeed-db
-  → elfeed-db-update-hook → elfeed-translate--on-db-update()
-      ├─ if elfeed-translate--busy → skip
-      ├─ collect untranslated titles (cache miss)
-      ├─ split into batches (elfeed-translate-batch-size, default 30)
-      └─ if elfeed-translate-parallel:
-           elfeed-translate--process-batches-parallel
-             dispatch up to elfeed-translate-max-concurrent batches →
-               url-retrieve (async) → each callback cache-set + dispatch
-               next pending batch → on last completion: save-cache + finalize
-         else:
-           elfeed-translate--process-batches  (recursive async chain)
-             each batch → url-retrieve (async) → parse JSON → cache-set
-             → recurse to next batch, or on last batch:
-                save-cache + finalize (regenerate affected RSS files)
-      [each request has a watchdog timer: elfeed-translate-request-timeout,
-       default 60s — on expiry the request is aborted and callback nil]
-      [--busy is held for the whole cycle in parallel mode, per-request in serial]
-
-[user runs elfeed-update again] → Elfeed fetches local file:// feeds
-  → translated titles appear with `translated` tag
+```text
+elfeed-translate.el   package code
+README.org            installation, configuration and behavior
+DEVELOPER.org         architecture, protocol, retry policy and gotchas
+LICENSE               GPL-3.0-or-later
+screenshots/          user-facing images
 ```
 
-### Key data structures
+## Validation
 
-- **Translation cache** (`elfeed-translate--cache`): hash table, `:test 'equal`,
-  key = original title string, value = translated title string. Persisted to
-  `~/.elfeed/translated/translate-cache.el` as a printed hash-table read back
-  with `read`. Saved *only after all batches complete* (crash mid-translation
-  loses that cycle, re-translated next time).
-- **Feed→file mapping**: `MD5(feed-url).xml` under
-  `elfeed-translate-output-dir`. Stable hash so users can hard-code `file:///`
-  URLs in their config.
-- **title→feeds reverse index**: temporary hash table during batch processing,
-  maps each original title to the list of feed URLs containing it (handles
-  cross-posted articles); used by `--finalize` to regenerate only affected
-  feeds' RSS.
-- **Entry GUIDs in generated RSS**: `<MD5(feed-url)>:<original-entry-id>` —
-  composite to avoid collisions since all translated feeds share the empty
-  namespace (`file:///`).
+- Evaluate: `M-x eval-buffer` in `elfeed-translate.el`.
+- Parentheses: run `check-parens` in the source buffer.
+- Byte compile: `emacs --batch -f batch-byte-compile elfeed-translate.el` with
+  Elfeed on `load-path`.
+- Live API: enable `elfeed-translate-debug`, then run
+  `M-x elfeed-translate-test-api`.
+- Interactive workflow: open Elfeed, update once to translate, inspect
+  `~/.elfeed/translated/*.xml`, and update again to verify cache hits.
 
-## Naming Conventions
+Synthetic buffer and callback tests are encouraged for request encoding,
+id-JSON parsing, `finish_reason` classification, and serial/parallel retry state.
+They need not call a real provider.
 
-- Public functions / public customize vars: `elfeed-translate-<name>` (no
-  double dash).
-- Private functions / private vars: `elfeed-translate--<name>` (double dash).
-- All `defcustom` belong to the `elfeed-translate` group (`:group 'elfeed`).
-- `;;;###autoload` appears before `elfeed-translate-show-feeds`,
-  `elfeed-translate-setup`, `elfeed-translate-teardown`, `elfeed-translate-update`,
-  `elfeed-translate-clear-cache`, `elfeed-translate-stats`,
-  `global-elfeed-translate-mode`, and the `add-hook` form. Preserve these when
-  editing.
-- File header uses Unicode box-drawing chars (`═`) to delimit sections — match
-  this style when adding new sections.
+## Architecture Summary
 
-## Critical Gotchas (non-obvious — read before touching API client / hooks)
+```text
+global mode -> elfeed-search-mode-hook -> setup
+setup -> SQLite + initial RSS + update hooks
+elfeed-update -> wait for all feeds -> collect uncached title/content
+  -> split and merge queues
+  -> validated unibyte HTTP request
+  -> structured API result
+  -> id validation
+  -> transactional cache write
+  -> regenerate affected local RSS
+```
 
-These are documented in `DEVELOPER.org` as fixed historical bugs. They are easy
-to regress:
+Important structures:
 
-1. **`json-parse-string` ignores dynamic vars when any keyword is passed.**
-   Passing `:object-type` / `:array-type` / `:null-object` / `:false-object` /
-   `:allow-trailing-content` as keyword args is *required* — do not rely on
-   `let`-binding `json-object-type` etc. The parse path also retries with
-   `:allow-trailing-content t` on first failure. See
-   `elfeed-translate--parse-response`.
+- Cache: `translate-cache.sqlite`, key `MD5(source-text)`, value raw translation.
+- Local feed: `MD5(feed-url).xml`.
+- Local entry GUID: `MD5(feed-url):original-entry-id`.
+- Queue item: `(:call-fn :texts :prompt :retries)`.
+- API success: `(:ok t :pairs ... :http-status ... :finish-reason ... :protocol ...)`.
+- API failure: `(:ok nil :kind ... :message ... :retryable ...)`.
+- Parallel state includes `:queue`, `:in-flight`, `:retry-waiting`, `:completed`
+  and `:total`.
 
-2. **`elfeed-translate--busy` must be cleared *before* invoking the callback**
-   (serial mode). The callback triggers the next batch in the recursive chain,
-   which checks `busy` and skips if still set. Clearing it only in the
-   `unwind-protect` cleanup form (after the callback) causes a batch-chain
-   deadlock. There is also a safety-net clear in the cleanup form in case the
-   callback throws. In parallel mode `--busy` is held for the whole cycle and
-   cleared once in `finalize-fn`; `--call-api` is called with `no-busy-guard`
-   so it does not touch the lock per-request.
+## Naming and File Conventions
 
-3. **Use `catch 'parse-error` / `throw 'parse-error`, not `cl-return-from`,
-   inside `condition-case` handlers.** `cl-return-from` cannot find the
-   `cl-block` established by `defun` from within a `condition-case` error
-   handler.
+- Public symbols: `elfeed-translate-<name>`.
+- Private symbols: `elfeed-translate--<name>`.
+- Every `defun`, `defcustom`, and `defvar` needs a docstring.
+- Keep all `defcustom` values in the `elfeed-translate` group.
+- Preserve `;;;###autoload` cookies on interactive commands and mode entry points.
+- Match the existing Unicode box-drawing section headers.
+- Preserve unrelated user changes in a dirty worktree.
 
-4. **System prompt template has exactly one `%s`** (the target language).
-   Earlier versions had three `%s` but only one `format` argument. If you add
-   more placeholders, update the `format` call in `--call-api` accordingly.
+## Critical Gotchas
 
-5. **`elfeed-translate--cache-set` skips storing when translation equals
-   original** (`(equal title translation)`). This avoids wasting entries on
-   "already in target language" titles but means those titles are re-scanned
-   every update. Known limitation; a sentinel value is a future improvement.
+1. Pass `:object-type`, `:array-type`, `:null-object`, and `:false-object`
+   directly to every `json-parse-string` call. Do not rely on dynamic JSON
+   variables.
+2. `elfeed-translate--build-request` must keep the outer JSON body UTF-8
+   unibyte and every HTTP header ASCII unibyte. A multibyte Authorization value
+   can make Emacs reject the request before sending it.
+3. The prompt templates have exactly one `%s`, for the global target language.
+4. Batch ids are generated as `item-0001`, `item-0002`, ... for each request.
+   Pair by id, never by returned array order.
+5. JSON source/output text may contain quotes, newlines, backslashes, HTML and
+   literal `---`. The separator parser is compatibility-only.
+6. `finish_reason=stop` (or a missing field for compatible providers) permits
+   output parsing. Truncation and other incomplete model completions are
+   structured translation failures; filters are non-retryable.
+7. Do not use `url-queue-retrieve`. It loses the dynamic request bindings when
+   actual retrieval is deferred. Use direct `url-retrieve` with the package's
+   own concurrency limiter.
+8. Preserve the timeout `done` guard. A late response must not invoke a callback
+   after the watchdog has completed the request.
+9. Both serial and parallel modes hold the cycle-level busy lock while retry
+   timers are pending. Parallel finalization must also check `:retry-waiting`.
+10. Keep parallel callback/timer state in top-level functions and the global
+    state plist; interpreted `eval-buffer` has historically been unreliable for
+    self-referential local async closures.
+11. Title display style is applied during RSS generation and does not invalidate
+    cached raw translations.
+12. Feed autotag checks use symbols and `memq`; retain compatibility with
+    elfeed-org underscore tags.
 
-6. **Title style/separator changes do NOT require cache invalidation.** The
-   cache stores raw translations; `elfeed-translate--format-title` applies
-   `elfeed-translate-title-style` only at RSS generation time. Re-running
-   `elfeed-translate-update` (or regenerating RSS) is sufficient.
+## Elfeed Integration
 
-7. **Feed tag matching uses `memq` on symbols**, so the autotag must be a
-   symbol. `elfeed-feed-autotags` converts keyword (`:translate-title`) to plain
-   symbol via `elfeed-keyword->symbol`, so both forms work. The default
-   `elfeed-translate-feed-tag` is `translate_title` (underscore) to match
-   `elfeed-org` colon-tag conventions; users on plain `elfeed-feeds` may set it
-   to `translate-title`.
-
-8. **`elfeed-translate-setup` is idempotent** via `elfeed-translate--setup-done`.
-   Heavy one-time work (directory creation, cache load, RSS generation) runs
-   once; subsequent calls only re-add the DB-update hook. Preserve this when
-   modifying setup logic.
-
-9. **Request timeout watchdog.** `elfeed-translate--call-api` arms a
-   `run-at-time` timer (`elfeed-translate-request-timeout`, default 60s). On
-   expiry it sets a shared `done` flag, kills the response-buffer process if
-   available, clears `--busy` (serial mode), and invokes the callback with
-   `nil`. The response callback checks `done` first and discards any late
-   response if the watchdog already fired — do not remove this guard or a
-   slow response arriving after timeout will double-invoke the callback and
-   corrupt batch counters.
-
-10. **Never use `url-queue-retrieve` for API calls.** `url-queue-retrieve`
-    defers the actual `url-retrieve` to an idle timer (0.01s later), which
-    runs *outside* the `let*` that binds `url-request-method`,
-    `url-request-extra-headers`, and `url-request-data`. The request is then
-    sent as a bodyless GET → HTTP 404. Parallel mode implements its own
-    concurrency limiter in `--process-batches-parallel` (a queue +
-    `in-flight` counter) that calls `url-retrieve` directly via `--call-api`,
-    keeping the `let*` bindings in scope. Do not switch back to
-    `url-queue-retrieve`.
-
-11. **`--call-api` always uses `url-retrieve`** (not `url-queue-retrieve`).
-    The `no-busy-guard` optional arg lets the parallel dispatcher bypass the
-    per-request busy lock so multiple requests can be in flight. Both serial
-    and parallel paths share the same watchdog + `done`-flag logic.
-
-12. **HTTP 4xx/5xx responses skip JSON parsing.** `--parse-response` checks
-    the HTTP status first via `--http-status`; on ≥ 400 it throws
-    `parse-error` immediately instead of feeding an HTML error page to
-    `json-parse-string`, which produces confusing error messages.
-
-13. **`elfeed-translate-test-api`** sends a minimal "Hello" prompt to the
-    configured API and displays the raw HTTP response (headers + body) in a
-    pop-up buffer. Use it to diagnose 404s, auth failures, or wrong model
-    names before running a full translation cycle.
-
-14. **Parallel dispatch state lives in a `defvar`, not `let*` closures.**
-    `elfeed-translate--parallel-state` (a plist) holds the queue, in-flight
-    counter, completed count, etc. `--parallel-callback` and
-    `--parallel-dispatch` are top-level `defun`s that read/write this
-    variable. This avoids the Emacs Lisp interpreter's failure to capture
-    `let*`/`letrec`-bound variables inside lambdas invoked from process
-    filters (async `url-retrieve` callbacks) — the byte-compiler handles
-    self-referential closures fine, but `eval-buffer` does not. Do not
-    refactor back to `let*` closures.
-
-## Elfeed Integration Points
-
-| Elfeed API | How this package uses it |
-|---|---|
-| `elfeed-feeds` | Iterated to find feeds with the translate tag |
-| `elfeed-db-entries` | Scanned by `--entries-for-feed` (filters on `elfeed-entry-feed-id`) |
-| `elfeed-db-get-feed` | Looks up feed struct by URL |
-| `elfeed-feed-autotags` | Wrapped by `--feed-autotags` to check for translate tag |
-| `elfeed-search-mode-hook` | Triggers `setup` when Elfeed opens |
-| `elfeed-db-update-hook` | Triggers `--on-db-update` after each feed fetch |
-| `elfeed-entry-title/link/date/id/feed-id` | Accessors used in RSS generation |
-| `elfeed-feed-title` | Used in `show-feeds` org link description |
+| API/hook | Use |
+|----------|-----|
+| `elfeed-feeds` / `elfeed-feed-autotags` | Find title/content tagged feeds |
+| `elfeed-db-entries` / `elfeed-db-get-feed` | Read entries and feed metadata |
+| `elfeed-update-init-hooks` | Reset expected-feed counter |
+| `elfeed-update-hooks` | Count completed feed retrievals |
+| `elfeed-search-mode-hook` | Run setup when global mode is enabled |
+| Entry/feed accessors | Generate local RSS metadata and content |
 
 ## Dependencies
 
-All built into Emacs 27.1 except `elfeed` (declared in `Package-Requires`):
-`elfeed`, `elfeed-db`, `url`, `json`, `xml`, `subr-x`, `cl-lib`, `seq`.
-
-## When Making Changes
-
-- **Read `DEVELOPER.org` first** — it has the authoritative architecture, call
-  graph, and historical bug record.
-- Keep the single-file structure; do not introduce subdirectories or split
-  modules without an explicit request.
-- Preserve `;;;###autoload` cookies on all interactive commands and the hook
-  registration.
-- Match the existing box-drawing section headers and double-dash private
-  naming.
-- After edits, byte-compile (`M-x emacs-lisp-byte-compile`) to catch warnings,
-  then run the interactive test sequence above if API behavior changed.
-- Emacs Lisp docstrings are mandatory for every `defun`/`defcustom`/`defvar` —
-  the file follows this consistently.
+Built into Emacs 29.1: `url`, `json`, `sqlite`, `xml`, `subr-x`, `cl-lib`, and
+`seq`. External: `elfeed` and `elfeed-db`.
