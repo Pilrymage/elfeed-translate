@@ -144,6 +144,9 @@ Module boundaries:
 12. Feed autotag checks use symbols and `memq`; retain compatibility with
     elfeed-org underscore tags.
 13. RSS declares UTF-8 and must bind `coding-system-for-write` to `utf-8-unix`.
+14. An `;;;###autoload` cookie must immediately precede its intended public
+    definition. Never leave one before a module `provide`: Straight would put
+    that `provide` in the generated autoload file and short-circuit `require`.
 
 ## Elfeed Integration
 

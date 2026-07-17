@@ -264,6 +264,10 @@ possible.
 7. Do not print or dump Authorization headers.
 8. Keep RSS output explicitly bound to =utf-8-unix=; its XML declaration says
    UTF-8 and Windows otherwise may use the locale code page.
+9. Never leave a dangling =;;;###autoload= cookie before a module's =provide=
+   form.  Straight's autoload generator will copy that =provide= into the
+   autoload file, causing later =require= calls to skip the real module while
+   its function definitions remain unloaded.
 
 * Validation
 

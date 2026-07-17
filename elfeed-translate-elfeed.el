@@ -276,7 +276,5 @@ FEEDS is a list of source feed URL strings."
       (insert (format ";; Original: %s\n" title))
       (insert (format "(\"%s\" %s)\n\n" local-url elfeed-translate-tag)))))
 
-;;;###autoload
-
 (provide 'elfeed-translate-elfeed)
 ;;; elfeed-translate-elfeed.el ends here

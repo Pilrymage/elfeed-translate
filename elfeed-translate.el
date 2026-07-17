@@ -771,16 +771,5 @@ automatically."
       (add-hook 'elfeed-search-mode-hook #'elfeed-translate-setup)
     (elfeed-translate-teardown)))
 
-;; ═══════════════════════════════════════════════════════════════════════
-;; Auto-start hook: run setup whenever the Elfeed search buffer opens.
-;; This mirrors how elfeed-org hooks into elfeed-search-mode-hook to
-;; load feeds — here we load the translation cache and enable the
-;; feed-update hooks automatically.  The setup function is idempotent so
-;; repeated calls are cheap.
-;; ═══════════════════════════════════════════════════════════════════════
-
-;;;###autoload
-
-
 (provide 'elfeed-translate)
 ;;; elfeed-translate.el ends here
