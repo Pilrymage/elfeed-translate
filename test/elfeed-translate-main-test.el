@@ -1,4 +1,4 @@
-;;; elfeed-translate-main-test.el --- Facade and dispatcher tests -*- lexical-binding: t; -*-
+;;; elfeed-translate-main-test.el --- Public facade tests -*- lexical-binding: t; -*-
 
 ;;; Code:
 
@@ -6,11 +6,12 @@
 (require 'elfeed-translate)
 (require 'loaddefs-gen)
 
-(ert-deftest elfeed-translate-main-loads-all-five-source-features ()
+(ert-deftest elfeed-translate-main-loads-all-six-source-features ()
   (dolist (feature '(elfeed-translate-core
                      elfeed-translate-cache
                      elfeed-translate-api
                      elfeed-translate-elfeed
+                     elfeed-translate-engine
                      elfeed-translate))
     (should (featurep feature))))
 
@@ -32,7 +33,10 @@
              (string-match-p "(provide 'elfeed-translate)" autoloads))
             (should-not
              (string-match-p
-              "(provide 'elfeed-translate-elfeed)" autoloads))))
+              "(provide 'elfeed-translate-elfeed)" autoloads))
+            (should-not
+             (string-match-p
+              "(provide 'elfeed-translate-engine)" autoloads))))
       (delete-directory temp-dir t))))
 
 (ert-deftest elfeed-translate-main-functions-live-in-expected-modules ()
@@ -46,34 +50,8 @@
            "elfeed-translate-elfeed.el"
            (symbol-file 'elfeed-translate--generate-rss 'defun)))
   (should (string-suffix-p
-           "elfeed-translate.el"
+           "elfeed-translate-engine.el"
            (symbol-file 'elfeed-translate--process-batches 'defun))))
-
-(ert-deftest elfeed-translate-main-splits-batches-without-loss ()
-  (should (equal (elfeed-translate--split-into-batches '(1 2 3 4 5) 2)
-                 '((1 2) (3 4) (5)))))
-
-(ert-deftest elfeed-translate-main-collects-through-module-boundaries ()
-  (let ((entry (elfeed-entry--create
-                :id "entry"
-                :title "new title"
-                :content "cached body"
-                :content-type 'html
-                :feed-id "feed")))
-    (cl-letf (((symbol-function 'elfeed-translate--translatable-feeds)
-               (lambda () '("feed")))
-              ((symbol-function 'elfeed-translate--feed-has-title-tag-p)
-               (lambda (_url) t))
-              ((symbol-function 'elfeed-translate--feed-has-content-tag-p)
-               (lambda (_url) t))
-              ((symbol-function 'elfeed-translate--entries-for-feed)
-               (lambda (_url) (list entry)))
-              ((symbol-function 'elfeed-translate--cache-get)
-               (lambda (source)
-                 (and (equal source "cached body") "正文"))))
-      (should (equal (elfeed-translate--collect-untranslated)
-                     '(:title-items (("feed" . "new title"))
-                       :content-items nil))))))
 
 (provide 'elfeed-translate-main-test)
 ;;; elfeed-translate-main-test.el ends here

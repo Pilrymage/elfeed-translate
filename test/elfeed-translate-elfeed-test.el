@@ -16,6 +16,21 @@
       (should (equal (elfeed-translate--format-title "Original" "译文")
                      "Original :: 译文")))))
 
+(ert-deftest elfeed-translate-elfeed-detects-stale-local-subscription ()
+  (let* ((elfeed-translate-output-dir "C:/new/translated")
+         (source "https://example.test/feed")
+         (filename (concat (secure-hash 'md5 source) ".xml"))
+         (old-url (concat "file:///C:/old/translated/" filename))
+         (elfeed-feeds (list old-url)))
+    (cl-letf (((symbol-function 'elfeed-translate--translatable-feeds)
+               (lambda () (list source))))
+      (should
+       (equal
+        (elfeed-translate--stale-local-feed-mappings)
+        (list
+         (cons old-url
+               (elfeed-translate--local-feed-url source))))))))
+
 (ert-deftest elfeed-translate-elfeed-rss-uses-injected-cache-lookup ()
   (let* ((test-dir (make-temp-file "elfeed-translate-rss-" t))
          (elfeed-translate-output-dir test-dir)

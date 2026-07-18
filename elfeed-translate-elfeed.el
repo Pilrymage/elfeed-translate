@@ -1,7 +1,7 @@
 ;;; elfeed-translate-elfeed.el --- Elfeed adapter for elfeed-translate -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.5.0
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 
@@ -103,6 +103,34 @@ or `elfeed-translate-content-tag' as an autotag in `elfeed-feeds'."
                   (elfeed-translate--feed-has-content-tag-p url))
           (push url feeds))))
     (nreverse feeds)))
+
+(defun elfeed-translate--normalize-local-feed-url (url)
+  "Return URL in a form suitable for local file URL comparison."
+  (downcase (replace-regexp-in-string "\\\\" "/" url t t)))
+
+(defun elfeed-translate--stale-local-feed-mappings ()
+  "Return configured translated feeds that point outside the active output.
+Each result is (CONFIGURED-URL . EXPECTED-URL).  Matching uses the
+stable feed hash filename, so old subscriptions can be identified
+after `elfeed-translate-output-dir' or `elfeed-db-directory' changes."
+  (let ((expected-by-file (make-hash-table :test 'equal))
+        (stale nil))
+    (dolist (source-url (elfeed-translate--translatable-feeds))
+      (let ((expected (elfeed-translate--local-feed-url source-url)))
+        (puthash (file-name-nondirectory expected)
+                 expected expected-by-file)))
+    (dolist (feed-spec elfeed-feeds)
+      (let ((configured (if (consp feed-spec) (car feed-spec) feed-spec)))
+        (when (and (stringp configured)
+                   (string-prefix-p "file:" configured t))
+          (when-let ((expected
+                      (gethash (file-name-nondirectory configured)
+                               expected-by-file)))
+            (unless (equal
+                     (elfeed-translate--normalize-local-feed-url configured)
+                     (elfeed-translate--normalize-local-feed-url expected))
+              (push (cons configured expected) stale))))))
+    (nreverse stale)))
 
 (defun elfeed-translate--entries-for-feed (feed-url)
   "Return all Elfeed entries belonging to FEED-URL, newest first."
@@ -243,7 +271,10 @@ Level-2 heading (\\*\\*) for the \"Translated feeds\" group so it can
 sit under a user's existing level-1 feed group.  Each feed is a
 level-3 heading (\\*\\*\\*) using an org link with the translated
 feed title as the description."
-  (insert "# Copy the headlines above into your elfeed-org file,\n")
+  (insert (format "# Active output directory: %s\n"
+                  (abbreviate-file-name elfeed-translate-output-dir)))
+  (insert "# Replace old translated file URLs with the headlines below.\n")
+  (insert "# Copy the headlines into your elfeed-org file,\n")
   (insert "# then run M-x elfeed-org-reload (or restart Emacs).\n")
   (insert "** Translated feeds")
   (when elfeed-translate-tag
@@ -264,7 +295,10 @@ feed title as the description."
 (defun elfeed-translate--insert-plain-format (feeds)
   "Insert translated feed URLs in `elfeed-feeds' compatible format.
 FEEDS is a list of source feed URL strings."
+  (insert (format ";; Active output directory: %s\n"
+                  (abbreviate-file-name elfeed-translate-output-dir)))
   (insert ";; Translated feed URLs for `elfeed-feeds'.\n")
+  (insert ";; Replace old translated file URLs with these entries.\n")
   (insert ";; Copy the lines below into your Elfeed configuration,\n")
   (insert ";; then run M-x elfeed-update.\n\n")
   (dolist (feed-url feeds)

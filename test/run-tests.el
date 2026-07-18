@@ -9,6 +9,7 @@
 (require 'elfeed-translate-cache-test)
 (require 'elfeed-translate-api-test)
 (require 'elfeed-translate-elfeed-test)
+(require 'elfeed-translate-engine-test)
 (require 'elfeed-translate-main-test)
 
 (ert-run-tests-batch-and-exit)

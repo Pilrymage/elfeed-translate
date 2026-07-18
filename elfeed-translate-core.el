@@ -1,7 +1,7 @@
 ;;; elfeed-translate-core.el --- Shared configuration for elfeed-translate -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.5.0
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 
@@ -85,7 +85,10 @@ and `elfeed-org' format:
 (defcustom elfeed-translate-output-dir
   (expand-file-name "translated" elfeed-db-directory)
   "Directory where translated RSS files are stored.
-Each configured feed gets its own file named <hash>.xml."
+Defaults to the `translated' subdirectory of `elfeed-db-directory'.
+Each configured feed gets its own file named <hash>.xml.  If the
+Elfeed database directory changes, existing file:// subscriptions
+must be updated with `elfeed-translate-show-feeds'."
   :type 'directory
   :group 'elfeed-translate)
 
