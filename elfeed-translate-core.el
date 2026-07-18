@@ -1,7 +1,7 @@
 ;;; elfeed-translate-core.el --- Shared configuration for elfeed-translate -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.6.0
+;; Version: 0.7.0
 ;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 
@@ -90,6 +90,16 @@ Each configured feed gets its own file named <hash>.xml.  If the
 Elfeed database directory changes, existing file:// subscriptions
 must be updated with `elfeed-translate-show-feeds'."
   :type 'directory
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-cache-file
+  (locate-user-emacs-file "var/elfeed-translate/translate-cache.sqlite")
+  "Persistent SQLite translation-cache file.
+This path is intentionally independent of
+`elfeed-translate-output-dir', so multiple generated-feed directories
+share one cache.  Do not place it in a Straight build directory:
+package rebuilds may replace or delete build artifacts."
+  :type 'file
   :group 'elfeed-translate)
 
 (defcustom elfeed-translate-system-prompt

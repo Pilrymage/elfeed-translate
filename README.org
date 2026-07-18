@@ -86,7 +86,8 @@ The equivalent =elfeed-org= tags are =:translate_title:= and
 | =elfeed-translate-batch-size= | =30= | Titles per request |
 | =elfeed-translate-content-batch-size= | =5= | Content snippets per request |
 | =elfeed-translate-content-max-chars= | =500= | Source characters per snippet |
-| =elfeed-translate-output-dir= | =<elfeed-db-directory>/translated= | SQLite and generated RSS directory |
+| =elfeed-translate-output-dir= | =<elfeed-db-directory>/translated= | Generated RSS directory |
+| =elfeed-translate-cache-file= | =~/.emacs.d/var/elfeed-translate/translate-cache.sqlite= | Shared persistent translation cache |
 | =elfeed-translate-parallel= | =nil= | Enable concurrent batches |
 | =elfeed-translate-max-concurrent= | =4= | Parallel request limit |
 | =elfeed-translate-request-timeout= | =60= | Per-request timeout in seconds |
@@ -171,12 +172,23 @@ always redacted.
 
 * Cache and Local Feeds
 
-The cache is =translate-cache.sqlite= under
-=elfeed-translate-output-dir=.  By default that directory is the =translated=
-subdirectory of =elfeed-db-directory=; it is not necessarily =~/.elfeed=.  Its
-key is the MD5 of the source text and its value is the raw translation.  Writes
-are committed per successful batch, so completed work survives later batch
-failures or an Emacs crash.
+The cache path is configured independently by
+=elfeed-translate-cache-file=.  Its default is
+=~/.emacs.d/var/elfeed-translate/translate-cache.sqlite= (relative to the actual
+=user-emacs-directory=).  Generated XML remains under
+=elfeed-translate-output-dir=.  Changing or maintaining several RSS output
+directories therefore does not fork translation history.
+
+The cache key is the MD5 of the source text and its value is the raw
+translation.  Writes are committed per successful batch, so completed work
+survives later batch failures or an Emacs crash.  On the first 0.7 load, SQLite
+databases found in the active output directory, the Elfeed DB output directory,
+and the historical =~/.elfeed/translated= location are merged into the fixed
+cache.  Preferred/newer sources are imported first; duplicate keys are not
+overwritten, and old database files are retained as recovery copies.
+
+Do not put the cache in Straight's =straight/build= directory.  Straight may
+replace that directory during a package rebuild.
 
 Each source feed maps to a stable =MD5(feed-url).xml= file.  Generated entry
 GUIDs combine the feed hash with the original entry id to avoid collisions.
@@ -201,7 +213,7 @@ modules from the same repository:
 | File | Responsibility |
 |------+----------------|
 | =elfeed-translate-core.el= | Customization and shared result values |
-| =elfeed-translate-cache.el= | SQLite persistence and cache-key ownership |
+| =elfeed-translate-cache.el= | Fixed SQLite persistence, legacy DB merge and cache-key ownership |
 | =elfeed-translate-api.el= | Request encoding, HTTP and response parsing |
 | =elfeed-translate-elfeed.el= | Elfeed DB access, feed paths and RSS rendering |
 | =elfeed-translate-engine.el= | Collection, serial/parallel dispatch, fail-fast abort and update hooks |

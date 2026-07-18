@@ -1,7 +1,7 @@
 ;;; elfeed-translate.el --- Translate Elfeed entry titles and content via LLM API -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.6.0
+;; Version: 0.7.0
 ;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 ;; URL: https://github.com/pilrymage/elfeed-translate
@@ -305,6 +305,8 @@ Shows all translatable feeds and their translation status."
   Target language: %s
   API endpoint   : %s
   Model          : %s
+  Cache file     : %s
+  Feed output    : %s
   Tagged feeds   : %d
   Cached entries : %d
 "
@@ -313,6 +315,8 @@ Shows all translatable feeds and their translation status."
                   elfeed-translate-target-lang
                   elfeed-translate-api-url
                   elfeed-translate-model
+                  (abbreviate-file-name (elfeed-translate--cache-file))
+                  (abbreviate-file-name elfeed-translate-output-dir)
                   (length feeds)
                   total-cached)
           lines)

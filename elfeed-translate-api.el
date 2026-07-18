@@ -1,7 +1,7 @@
 ;;; elfeed-translate-api.el --- OpenAI-compatible client for elfeed-translate -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.6.0
+;; Version: 0.7.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: news, rss, translation
 

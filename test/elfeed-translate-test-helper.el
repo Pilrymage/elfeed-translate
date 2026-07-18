@@ -19,8 +19,11 @@
   `(let ((test-dir (make-temp-file "elfeed-translate-cache-" t))
          (elfeed-translate--db nil))
      (unwind-protect
-         (let ((elfeed-translate-output-dir test-dir))
-           (elfeed-translate--load-cache)
+         (let ((elfeed-translate-output-dir
+                (expand-file-name "feeds-a" test-dir))
+               (elfeed-translate-cache-file
+                (expand-file-name "data/translate-cache.sqlite" test-dir)))
+           (elfeed-translate--load-cache :none)
            ,@body)
        (elfeed-translate--close-cache)
        (delete-directory test-dir t))))

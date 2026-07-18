@@ -82,7 +82,8 @@ elfeed-update -> wait for all feeds -> collect uncached title/content
 
 Important structures:
 
-- Cache: `translate-cache.sqlite`, key `MD5(source-text)`, value raw translation.
+- Cache: `elfeed-translate-cache-file`, independent of RSS output; key
+  `MD5(source-text)`, value raw translation.
 - Local feed: `MD5(feed-url).xml`.
 - Local entry GUID: `MD5(feed-url):original-entry-id`.
 - Queue item: `(:call-fn :texts :prompt :retries)`.
@@ -153,6 +154,9 @@ Module boundaries:
     and ignore stale callbacks from an older state object.
 16. `elfeed-translate-output-dir` follows `elfeed-db-directory` by default.
     Warn when configured translated `file:///` feeds still point elsewhere.
+17. `elfeed-translate-cache-file` is durable user data and must stay independent
+    of output directories and Straight build artifacts. Legacy SQLite imports
+    use ordered `INSERT OR IGNORE` and retain every source database.
 
 ## Elfeed Integration
 

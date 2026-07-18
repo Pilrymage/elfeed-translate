@@ -208,9 +208,11 @@ closures for reliable =eval-buffer= behavior.
 
 * SQLite Translation Cache
 
-The cache file is =translate-cache.sqlite= under
-=elfeed-translate-output-dir= (by default
-=<elfeed-db-directory>/translated=).  Schema:
+The cache is deliberately independent of RSS output.  Its path is
+=elfeed-translate-cache-file=, defaulting to
+=<user-emacs-directory>/var/elfeed-translate/translate-cache.sqlite=.  Do not
+store persistent state under Straight's build directory because rebuilds may
+replace it.  Schema:
 
 #+begin_src sql
 CREATE TABLE translations (
@@ -227,6 +229,13 @@ Each successful batch is written in one SQLite transaction.  Cache persistence
 is therefore incremental and crash-safe.  The legacy
 =translate-cache.el= hash table is migrated once and renamed with a
 =.migrated= suffix.
+
+Version 0.7 also discovers SQLite databases from the active RSS output,
+=<elfeed-db-directory>/translated= and the historical
+=~/.elfeed/translated= directory.  They are attached and only read from, in
+priority order, then merged with =INSERT OR IGNORE=, so the first/preferred
+database wins on duplicate keys.  A =migrated_sqlite:<sha256-path>= entry in
+=meta= prevents repeat work.  Source databases are retained as recovery copies.
 
 Title display style is not part of the cache.  Formatting is applied when RSS
 is generated, so changing title order or separator only requires regeneration.
@@ -277,6 +286,9 @@ possible.
    form.  Straight's autoload generator will copy that =provide= into the
    autoload file, causing later =require= calls to skip the real module while
    its function definitions remain unloaded.
+10. Keep =elfeed-translate-cache-file= independent of RSS output.  Legacy
+    SQLite merges must preserve source files and use first-source-wins conflict
+    handling; never silently delete or overwrite historical databases.
 
 * Validation
 
