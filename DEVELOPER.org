@@ -24,23 +24,24 @@ explicit cache clear.
 
 * Source Layout
 
-The package facade and four internal modules live together on =load-path=.
+The package facade and five internal modules live together on =load-path=.
 Users continue to load only =(require 'elfeed-translate)=.
 
 | File | Responsibility |
 |------+----------------|
-| =elfeed-translate.el= | Public commands, setup/teardown, update hooks, collection, serial/parallel dispatch and global mode |
+| =elfeed-translate.el= | Public commands, setup/teardown and global mode |
 | =elfeed-translate-core.el= | Customization and shared structured-result helpers |
 | =elfeed-translate-cache.el= | SQLite schema, migration, lookup, cache-key generation and transactional writes |
 | =elfeed-translate-api.el= | Request validation, HTTP transport, response parsing and diagnostics |
 | =elfeed-translate-elfeed.el= | Elfeed DB/tag access, entry extraction, feed paths, RSS rendering and display helpers |
+| =elfeed-translate-engine.el= | Collection, batching, retries, serial/parallel state, fail-fast abort, update hooks and finalization |
 | =test/*.el= | Offline ERT tests, one suite per source module, plus the batch runner |
 
-Dependencies are deliberately one-way.  The facade requires all four internal
-modules.  Cache and API require core; the Elfeed adapter requires core.  The API
-does not know SQLite cache keys or translation-cycle busy state.  RSS rendering
-receives a translation lookup function from the facade, so the Elfeed adapter
-does not require the cache module.
+Dependencies are deliberately one-way.  The facade requires the engine and
+adapters.  The engine requires core, cache, API and Elfeed adapter; adapters do
+not require the engine or facade.  The API does not know SQLite cache keys or
+translation-cycle busy state.  RSS rendering receives a translation lookup
+function from the engine/facade, so the Elfeed adapter does not require cache.
 
 Dependencies are built into Emacs 29.1 except Elfeed: =url=, =json=, =sqlite=,
 =xml=, =subr-x=, =cl-lib= and =seq=.
@@ -193,6 +194,12 @@ Retryable failures use exponential backoff with up to 25 percent jitter.  The
 delay is capped by =elfeed-translate-retry-max-delay=.  Serial and parallel
 dispatchers both hold =elfeed-translate--busy= across delayed retries.
 
+Fatal cycle-wide failures (=network=, =timeout=, =send=, =http=,
+=empty-response= and request/configuration failures) clear every unsent batch
+and cancel delayed retries.  Requests already in flight are drained.  The
+engine then writes any successful results, regenerates RSS once, clears busy
+state and reports completed/failed/skipped counts.
+
 Parallel state lives in =elfeed-translate--parallel-state=, including
 =:queue=, =:in-flight=, =:retry-waiting=, =:completed= and =:total=.  Delayed
 retries increment =:retry-waiting= so an empty queue cannot finalize early.
@@ -201,7 +208,9 @@ closures for reliable =eval-buffer= behavior.
 
 * SQLite Translation Cache
 
-The cache file is =~/.elfeed/translated/translate-cache.sqlite=.  Schema:
+The cache file is =translate-cache.sqlite= under
+=elfeed-translate-output-dir= (by default
+=<elfeed-db-directory>/translated=).  Schema:
 
 #+begin_src sql
 CREATE TABLE translations (
@@ -253,7 +262,7 @@ possible.
 1. Always pass =:object-type=, =:array-type=, =:null-object= and
    =:false-object= directly to =json-parse-string=.
 2. The API module must not read or mutate =elfeed-translate--busy=.  Serial and
-   parallel dispatch in the facade own the lock for the complete cycle.
+   parallel dispatch in the engine own the lock for the complete cycle.
 3. Do not replace direct =url-retrieve= with =url-queue-retrieve=: delayed
    execution loses dynamic request bindings.
 4. Preserve the timeout =done= guard to prevent double callbacks.

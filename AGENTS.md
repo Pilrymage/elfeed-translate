@@ -4,7 +4,7 @@ Guide for AI agents working in `elfeed-translate`.
 
 ## Project
 
-`elfeed-translate` is a five-file Emacs Lisp package that translates Elfeed
+`elfeed-translate` is a six-file Emacs Lisp package that translates Elfeed
 entry titles and/or content through an OpenAI-compatible
 `/chat/completions` API. It writes separate local RSS 2.0 feeds so original
 subscriptions and Elfeed entries remain untouched.
@@ -16,9 +16,8 @@ subscriptions and Elfeed entries remain untouched.
 - `README.org` is user-facing; `DEVELOPER.org` is the authoritative architecture
   and protocol document. Read `DEVELOPER.org` before non-trivial changes.
 
-The dispatch engine intentionally remains in `elfeed-translate.el` for this
-stage. Do not extract a sixth engine module until the user has validated the
-five-file version.
+The dispatch engine is isolated in `elfeed-translate-engine.el`; the public
+facade should remain thin.
 
 ## Design Invariants
 
@@ -35,11 +34,12 @@ five-file version.
 ## Repository Layout
 
 ```text
-elfeed-translate.el          public facade, hooks and batch dispatch
+elfeed-translate.el          public facade, setup and global mode
 elfeed-translate-core.el     customization and result helpers
 elfeed-translate-cache.el    SQLite persistence
 elfeed-translate-api.el      HTTP and translation protocol
 elfeed-translate-elfeed.el   Elfeed DB adapter and RSS rendering
+elfeed-translate-engine.el   collection, dispatch, retry and update hooks
 test/                        offline ERT suites and batch runner
 README.org                   installation, configuration and behavior
 DEVELOPER.org                architecture, protocol, retry policy and gotchas
@@ -54,13 +54,13 @@ screenshots/                 user-facing images
 - Parentheses: run `check-parens` in every source and test buffer.
 - Tests: `emacs --batch -Q -L . -L test -L /path/to/straight/build/elfeed
   -l test/run-tests.el`.
-- Byte compile all five source files and tests with Elfeed on `load-path`.
+- Byte compile all six source files and tests with Elfeed on `load-path`.
 - `emacsclient` smoke tests should use a temporary named daemon rather than
   loading test code into the user's active Emacs server.
 - Live API: enable `elfeed-translate-debug`, then run
   `M-x elfeed-translate-test-api`.
 - Interactive workflow: open Elfeed, update once to translate, inspect
-  `~/.elfeed/translated/*.xml`, and update again to verify cache hits.
+  `elfeed-translate-output-dir`, and update again to verify cache hits.
 
 The committed tests use synthetic buffers and callbacks for request encoding,
 id-JSON parsing, `finish_reason`, SQLite, RSS and module boundaries. They do not
@@ -99,7 +99,8 @@ Module boundaries:
   state.
 - The Elfeed adapter accepts a translation lookup function when rendering RSS;
   it must not require the cache module.
-- The facade owns cross-module orchestration, collection and retry dispatch.
+- The engine owns cross-module orchestration, collection and retry dispatch;
+  the facade owns public commands and mode lifecycle.
 
 ## Naming and File Conventions
 
@@ -147,6 +148,11 @@ Module boundaries:
 14. An `;;;###autoload` cookie must immediately precede its intended public
     definition. Never leave one before a module `provide`: Straight would put
     that `provide` in the generated autoload file and short-circuit `require`.
+15. Fatal network/proxy/provider failures abort all unsent batches. Parallel
+    callbacks must drain requests already in flight, finalize RSS exactly once,
+    and ignore stale callbacks from an older state object.
+16. `elfeed-translate-output-dir` follows `elfeed-db-directory` by default.
+    Warn when configured translated `file:///` feeds still point elsewhere.
 
 ## Elfeed Integration
 

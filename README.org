@@ -86,6 +86,7 @@ The equivalent =elfeed-org= tags are =:translate_title:= and
 | =elfeed-translate-batch-size= | =30= | Titles per request |
 | =elfeed-translate-content-batch-size= | =5= | Content snippets per request |
 | =elfeed-translate-content-max-chars= | =500= | Source characters per snippet |
+| =elfeed-translate-output-dir= | =<elfeed-db-directory>/translated= | SQLite and generated RSS directory |
 | =elfeed-translate-parallel= | =nil= | Enable concurrent batches |
 | =elfeed-translate-max-concurrent= | =4= | Parallel request limit |
 | =elfeed-translate-request-timeout= | =60= | Per-request timeout in seconds |
@@ -146,6 +147,11 @@ Retryable failures use exponential backoff with jitter.  Both serial and
 parallel dispatchers hold the cycle-level busy lock while waiting, preventing a
 second translation cycle from starting over the same uncached entries.
 
+Network, proxy, DNS, timeout and provider HTTP failures abort the complete
+cycle.  No further queued batches are sent; already in-flight parallel requests
+are allowed to finish, then successfully returned translations are cached and
+RSS finalization still runs once.
+
 * Commands
 
 | Command | Purpose |
@@ -165,10 +171,12 @@ always redacted.
 
 * Cache and Local Feeds
 
-The cache is =~/.elfeed/translated/translate-cache.sqlite=.  Its key is the MD5
-of the source text and its value is the raw translation.  Writes are committed
-per successful batch, so completed work survives later batch failures or an
-Emacs crash.
+The cache is =translate-cache.sqlite= under
+=elfeed-translate-output-dir=.  By default that directory is the =translated=
+subdirectory of =elfeed-db-directory=; it is not necessarily =~/.elfeed=.  Its
+key is the MD5 of the source text and its value is the raw translation.  Writes
+are committed per successful batch, so completed work survives later batch
+failures or an Emacs crash.
 
 Each source feed maps to a stable =MD5(feed-url).xml= file.  Generated entry
 GUIDs combine the feed hash with the original entry id to avoid collisions.
@@ -176,13 +184,18 @@ Title display formatting is applied only during RSS generation, so changing
 =elfeed-translate-title-style= or =elfeed-translate-title-separator= does not
 invalidate cached translations.
 
+If the output directory changes while old =file:///= translated subscriptions
+remain in =elfeed-feeds=, setup displays a warning.  Run
+=M-x elfeed-translate-show-feeds= and replace those URLs; otherwise Elfeed keeps
+reading XML files from the old directory even though translation succeeded.
+
 Generated RSS is always written as UTF-8 with Unix line endings, including on
 Windows where the default file coding system may otherwise be a locale code
 page.
 
 * Source Modules
 
-The public entry point remains =elfeed-translate.el=.  It loads four internal
+The public entry point remains =elfeed-translate.el=.  It loads five internal
 modules from the same repository:
 
 | File | Responsibility |
@@ -191,12 +204,13 @@ modules from the same repository:
 | =elfeed-translate-cache.el= | SQLite persistence and cache-key ownership |
 | =elfeed-translate-api.el= | Request encoding, HTTP and response parsing |
 | =elfeed-translate-elfeed.el= | Elfeed DB access, feed paths and RSS rendering |
-| =elfeed-translate.el= | Public commands, hooks, collection and batch dispatch |
+| =elfeed-translate-engine.el= | Collection, serial/parallel dispatch, fail-fast abort and update hooks |
+| =elfeed-translate.el= | Public commands, setup and global minor mode |
 
 The API returns source-text/translation pairs and has no knowledge of SQLite.
 The cache module alone converts source text to MD5 keys.  Likewise, the API
 performs one HTTP request without reading the translation-cycle busy state;
-serial and parallel coordination remains in the main facade for now.
+serial and parallel coordination belongs to the engine module.
 
 * Tests
 
