@@ -1,7 +1,7 @@
 ;;; elfeed-translate-core.el --- Shared configuration for elfeed-translate -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 
@@ -217,20 +217,10 @@ opening it."
   :type 'integer
   :group 'elfeed-translate)
 
-(defcustom elfeed-translate-parallel nil
-  "When non-nil, dispatch translation batches concurrently.
-Parallel mode keeps at most `elfeed-translate-max-concurrent' API
-requests in flight simultaneously, which is faster for AI endpoints
-with quick responses.  When nil, batches are processed
-sequentially: each request waits for the previous one to complete
-before sending, which is safer for slow or rate-limited endpoints."
-  :type 'boolean
-  :group 'elfeed-translate)
-
 (defcustom elfeed-translate-max-concurrent 4
   "Maximum number of API requests in flight simultaneously.
-Used only in parallel mode.  Has no effect when
-`elfeed-translate-parallel' is nil."
+Set to 1 to process batches strictly sequentially, which is
+safer for slow or rate-limited endpoints."
   :type 'integer
   :group 'elfeed-translate)
 
@@ -269,14 +259,14 @@ failures stop immediately."
   :group 'elfeed-translate)
 
 (defcustom elfeed-translate-max-consecutive-fatal 3
-  "Maximum consecutive transport failures before aborting a parallel cycle.
-In parallel mode, transport failures (`network', `timeout', `send')
-and exhausted 429 throttling each increment a consecutive-fatal
-counter.  When the counter reaches this limit the cycle is aborted:
-pending batches are discarded and in-flight batches are allowed to
-drain.  A higher value tolerates more scattered transient errors
-before giving up; a lower value aborts sooner on sustained network
-or proxy problems.  Has no effect in serial mode."
+  "Maximum consecutive transport failures before aborting a cycle.
+Transport failures (`network', `timeout', `send') and exhausted
+429 throttling each increment a consecutive-fatal counter.  When
+the counter reaches this limit the cycle is aborted: pending
+batches are discarded and in-flight batches are allowed to drain.
+A higher value tolerates more scattered transient errors before
+giving up; a lower value aborts sooner on sustained network or
+proxy problems."
   :type 'integer
   :group 'elfeed-translate)
 
@@ -285,8 +275,7 @@ or proxy problems.  Has no effect in serial mode."
 The provider's `Retry-After' header is honored as a hint but clamped
 to this value so an unreasonable response cannot freeze the cycle.
 When `Retry-After' is missing, a fallback derived from
-`elfeed-translate-retry-base-delay' is used.  Has no effect in
-serial mode."
+`elfeed-translate-retry-base-delay' is used."
   :type 'number
   :group 'elfeed-translate)
 

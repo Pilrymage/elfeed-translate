@@ -88,18 +88,22 @@ The equivalent =elfeed-org= tags are =:translate_title:= and
 | =elfeed-translate-content-max-chars= | =500= | Source characters per snippet |
 | =elfeed-translate-output-dir= | =<elfeed-db-directory>/translated= | Generated RSS directory |
 | =elfeed-translate-cache-file= | =~/.emacs.d/var/elfeed-translate/translate-cache.sqlite= | Shared persistent translation cache |
-| =elfeed-translate-parallel= | =nil= | Enable concurrent batches |
-| =elfeed-translate-max-concurrent= | =4= | Parallel request limit |
+| =elfeed-translate-max-concurrent= | =4= | Concurrent request limit (1 = sequential) |
 | =elfeed-translate-request-timeout= | =60= | Per-request timeout in seconds |
 | =elfeed-translate-max-retries= | =3= | Retries for translation-result failures |
 | =elfeed-translate-retry-base-delay= | =1.0= | Initial retry delay |
 | =elfeed-translate-retry-max-delay= | =30.0= | Maximum retry delay |
-| =elfeed-translate-max-consecutive-fatal= | =3= | Parallel circuit-breaker threshold |
+| =elfeed-translate-max-consecutive-fatal= | =3= | Circuit-breaker threshold |
 | =elfeed-translate-max-throttle-wait= | =30= | Max 429 =Retry-After= honored (seconds) |
 | =elfeed-translate-auto-refresh= | =nil= | Fetch local feeds after translation |
 | =elfeed-translate-debug= | =nil= | Detailed credential-safe diagnostics |
 
 All options are available through =M-x customize-group RET elfeed-translate=.
+
+Since 0.8.0 batches are always dispatched concurrently.  The removed
+=elfeed-translate-parallel= toggle is subsumed by
+=elfeed-translate-max-concurrent=: set it to 1 for the former strictly
+sequential behavior.
 
 * Batch JSON Protocol
 
@@ -146,15 +150,14 @@ cycle occupied.
 | Invalid translation JSON or missing/duplicate/unknown ids | Yes | The model failed the batch protocol |
 | Translation count mismatch in the legacy fallback | Yes | The batch cannot be paired safely |
 
-Retryable failures use exponential backoff with jitter.  Both serial and
-parallel dispatchers hold the cycle-level busy lock while waiting, preventing a
-second translation cycle from starting over the same uncached entries.
+Retryable failures use exponential backoff with jitter.  The dispatcher holds
+the cycle-level busy lock while waiting, preventing a second translation cycle
+from starting over the same uncached entries.
 
-** Parallel failure handling
+** Failure handling
 
-Parallel mode replaces the serial fail-fast behavior with a circuit breaker
-and a 429 throttle, so scattered transient errors do not abort an otherwise
-healthy translation cycle:
+A circuit breaker and a 429 throttle keep scattered transient errors from
+aborting an otherwise healthy translation cycle:
 
 - Transport failures (=network=, =timeout=, =send=) self-heal once: the batch
   is re-queued after a short backoff.  Each such failure increments a
@@ -166,10 +169,10 @@ healthy translation cycle:
   the queue.  After two throttled retries a still-rate-limited batch escalates
   to a fatal failure.
 - Other failures (configuration, non-429 HTTP, parse errors, ...) abort the
-  cycle immediately, as in serial mode.
+  cycle immediately.
 
 Network, proxy, DNS, timeout and provider HTTP failures abort the complete
-cycle.  No further queued batches are sent; already in-flight parallel requests
+cycle.  No further queued batches are sent; already in-flight requests
 are allowed to finish, then successfully returned translations are cached and
 RSS finalization still runs once.
 
@@ -236,13 +239,13 @@ modules from the same repository:
 | =elfeed-translate-cache.el= | Fixed SQLite persistence, legacy DB merge and cache-key ownership |
 | =elfeed-translate-api.el= | Request encoding, HTTP and response parsing |
 | =elfeed-translate-elfeed.el= | Elfeed DB access, feed paths and RSS rendering |
-| =elfeed-translate-engine.el= | Collection, serial/parallel dispatch, circuit breaker, 429 throttle and update hooks |
+| =elfeed-translate-engine.el= | Collection, bounded concurrent dispatch, circuit breaker, 429 throttle and update hooks |
 | =elfeed-translate.el= | Public commands, setup and global minor mode |
 
 The API returns source-text/translation pairs and has no knowledge of SQLite.
 The cache module alone converts source text to MD5 keys.  Likewise, the API
 performs one HTTP request without reading the translation-cycle busy state;
-serial and parallel coordination belongs to the engine module.
+dispatch coordination belongs to the engine module.
 
 * Tests
 

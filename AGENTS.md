@@ -27,11 +27,10 @@ facade should remain thin.
 2. Title and content translation are independent feed-tag capabilities.
 3. Batch input/output uses id-bearing JSON. Every expected id must occur exactly
    once before any result is cached.
-4. Serial mode fails fast on transport and HTTP failures (including 429):
-   only validly delivered requests with unusable translation results are
-   retried. Parallel mode instead uses a consecutive-fatal circuit breaker for
-   transport failures and a 429 throttle pause; see DEVELOPER.org. In both
-   modes a batch is cached only when every expected id is returned exactly once.
+4. Transport failures use a consecutive-fatal circuit breaker and HTTP 429 a
+   throttle pause; only validly delivered requests with unusable translation
+   results are retried. See DEVELOPER.org. A batch is cached only when every
+   expected id is returned exactly once.
 5. API credentials must never be logged or written to diagnostic buffers.
 
 ## Repository Layout
@@ -92,9 +91,10 @@ Important structures:
 - Queue item: `(:call-fn :texts :prompt :retries)`.
 - API success: `(:ok t :pairs ... :http-status ... :finish-reason ... :protocol ...)`.
 - API failure: `(:ok nil :kind ... :message ... :retryable ...)`.
-- Parallel state includes `:queue`, `:in-flight`, `:retry-waiting`, `:completed`,
-  `:total`, `:consecutive-fatal`, `:fatal-limit` and `:throttle-until`. Queue
-  elements carry `:heal-retries` and `:throttle-retries` alongside `:retries`.
+- Dispatch state includes `:queue`, `:in-flight`, `:retry-waiting`,
+  `:completed`, `:total`, `:consecutive-fatal`, `:fatal-limit` and
+  `:throttle-until`. Queue elements carry `:heal-retries` and
+  `:throttle-retries` alongside `:retries`.
 
 Module boundaries:
 
@@ -140,9 +140,9 @@ Module boundaries:
    own concurrency limiter.
 8. Preserve the timeout `done` guard. A late response must not invoke a callback
    after the watchdog has completed the request.
-9. Both serial and parallel modes hold the cycle-level busy lock while retry
-   timers are pending. Parallel finalization must also check `:retry-waiting`.
-10. Keep parallel callback/timer state in top-level functions and the global
+9. The dispatcher holds the cycle-level busy lock while retry timers are
+   pending. Finalization must also check `:retry-waiting`.
+10. Keep dispatch callback/timer state in top-level functions and the global
     state plist; interpreted `eval-buffer` has historically been unreliable for
     self-referential local async closures.
 11. Title display style is applied during RSS generation and does not invalidate
@@ -153,13 +153,11 @@ Module boundaries:
 14. An `;;;###autoload` cookie must immediately precede its intended public
     definition. Never leave one before a module `provide`: Straight would put
     that `provide` in the generated autoload file and short-circuit `require`.
-15. In serial mode, fatal network/proxy/provider failures abort all unsent
-    batches immediately. In parallel mode, transport failures self-heal once
-    and increment a consecutive-fatal circuit; HTTP 429 throttles dispatch
-    until `Retry-After` (clamped) expires. When the circuit trips or a
-    non-transport fatal occurs, parallel callbacks must drain requests already
-    in flight, finalize RSS exactly once, and ignore stale callbacks from an
-    older state object.
+15. Transport failures self-heal once and increment a consecutive-fatal
+    circuit; HTTP 429 throttles dispatch until `Retry-After` (clamped)
+    expires. When the circuit trips or a non-transport fatal occurs, dispatch
+    callbacks must drain requests already in flight, finalize RSS exactly
+    once, and ignore stale callbacks from an older state object.
 16. `elfeed-translate-output-dir` follows `elfeed-db-directory` by default.
     Warn when configured translated `file:///` feeds still point elsewhere.
 17. `elfeed-translate-cache-file` is durable user data and must stay independent

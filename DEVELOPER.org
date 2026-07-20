@@ -34,7 +34,7 @@ Users continue to load only =(require 'elfeed-translate)=.
 | =elfeed-translate-cache.el= | SQLite schema, migration, lookup, cache-key generation and transactional writes |
 | =elfeed-translate-api.el= | Request validation, HTTP transport, response parsing and diagnostics |
 | =elfeed-translate-elfeed.el= | Elfeed DB/tag access, entry extraction, feed paths, RSS rendering and display helpers |
-| =elfeed-translate-engine.el= | Collection, batching, retries, serial/parallel state, circuit breaker, 429 throttle, update hooks and finalization |
+| =elfeed-translate-engine.el= | Collection, batching, retries, dispatch state, circuit breaker, 429 throttle, update hooks and finalization |
 | =test/*.el= | Offline ERT tests, one suite per source module, plus the batch runner |
 
 Dependencies are deliberately one-way.  The facade requires the engine and
@@ -65,7 +65,7 @@ elfeed-update
         -> deduplicate source text
         -> split title and content batches independently
         -> merge them into one queue
-        -> serial or bounded-parallel dispatch
+        -> bounded concurrent dispatch
         -> transactional cache write for every successful batch
         -> regenerate affected local RSS files
         -> optional guarded auto-refresh
@@ -191,12 +191,12 @@ unavailable, but give the model a limited chance to correct an otherwise valid
 translation request.
 
 Retryable failures use exponential backoff with up to 25 percent jitter.  The
-delay is capped by =elfeed-translate-retry-max-delay=.  Serial and parallel
-dispatchers both hold =elfeed-translate--busy= across delayed retries.
+delay is capped by =elfeed-translate-retry-max-delay=.  The dispatcher holds
+=elfeed-translate--busy= across delayed retries.
 
-** Parallel retry policy (circuit breaker + 429 throttle)
+** Dispatch retry policy (circuit breaker + 429 throttle)
 
-Parallel mode does not fail-fast on transport errors.  Instead it combines a
+The dispatcher does not fail-fast on transport errors.  Instead it combines a
 consecutive-fatal circuit breaker with a 429 throttle pause:
 
 - *Transport self-heal.*  A =network=, =timeout= or =send= failure is re-queued
@@ -219,14 +219,13 @@ consecutive-fatal circuit breaker with a 429 throttle pause:
 
 - *Other fatal failures.*  Configuration, request-validation, parse,
   api-structure, non-429 HTTP and empty-response failures abort the cycle
-  immediately, exactly as in serial mode.
+  immediately.
 
 The two circuits are orthogonal: 429 throttling does not block transport
 self-heal accounting, and a 429 pause does not exempt in-flight transport
-failures from incrementing =:consecutive-fatal=.  Serial mode is unchanged:
-transport and HTTP failures still abort on first contact.
+failures from incrementing =:consecutive-fatal=.
 
-Parallel state lives in =elfeed-translate--parallel-state=, including
+Dispatch state lives in =elfeed-translate--dispatch-state=, including
 =:queue=, =:in-flight=, =:retry-waiting=, =:completed=, =:total=,
 =:consecutive-fatal=, =:fatal-limit= and =:throttle-until=.  Delayed
 retries increment =:retry-waiting= so an empty queue cannot finalize early.
@@ -299,8 +298,8 @@ possible.
 
 1. Always pass =:object-type=, =:array-type=, =:null-object= and
    =:false-object= directly to =json-parse-string=.
-2. The API module must not read or mutate =elfeed-translate--busy=.  Serial and
-   parallel dispatch in the engine own the lock for the complete cycle.
+2. The API module must not read or mutate =elfeed-translate--busy=.  Dispatch
+   in the engine owns the lock for the complete cycle.
 3. Do not replace direct =url-retrieve= with =url-queue-retrieve=: delayed
    execution loses dynamic request bindings.
 4. Preserve the timeout =done= guard to prevent double callbacks.
@@ -336,7 +335,7 @@ output, module ownership, collection and batching.  Before releasing changes:
 2. Byte-compile all source and test modules with Elfeed on =load-path=.
 3. Optionally start a temporary daemon and use =emacsclient= to require the
    facade and confirm =symbol-file= ownership for each internal function.
-4. Exercise serial and parallel delayed retries and confirm the busy lock and
-   parallel state are cleared exactly once.
+4. Exercise delayed retries and confirm the busy lock and dispatch state are
+   cleared exactly once.
 5. Run =M-x elfeed-translate-test-api= against the configured provider.
 6. Run an Elfeed update twice and verify the second cycle is a cache hit.

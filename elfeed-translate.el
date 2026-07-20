@@ -1,7 +1,7 @@
 ;;; elfeed-translate.el --- Translate Elfeed entry titles and content via LLM API -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "29.1") (elfeed "3.0"))
 ;; Keywords: news, rss, translation
 ;; URL: https://github.com/pilrymage/elfeed-translate

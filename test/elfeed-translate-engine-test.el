@@ -44,7 +44,7 @@
 
 (ert-deftest elfeed-translate-engine-sync-network-failure-aborts-pending ()
   "A synchronous proxy/DNS failure must not dispatch later batches."
-  (let ((elfeed-translate--parallel-state nil)
+  (let ((elfeed-translate--dispatch-state nil)
         (elfeed-translate--busy nil)
         (elfeed-translate-max-concurrent 4)
         (elfeed-translate-max-consecutive-fatal 1)
@@ -64,15 +64,15 @@
                  (list :call-fn call-fn :texts (list text)
                        :prompt "prompt %s" :retries 0))
                '("one" "two" "three"))))
-        (elfeed-translate--process-batches-parallel queue '("feed"))))
+        (elfeed-translate--process-batches queue '("feed"))))
     (should (= calls 1))
     (should (equal finalized '("feed")))
     (should-not elfeed-translate--busy)
-    (should-not elfeed-translate--parallel-state)))
+    (should-not elfeed-translate--dispatch-state)))
 
 (ert-deftest elfeed-translate-engine-async-network-failure-drains-in-flight ()
   "Fatal failure drops pending work but preserves completed in-flight work."
-  (let ((elfeed-translate--parallel-state nil)
+  (let ((elfeed-translate--dispatch-state nil)
         (elfeed-translate--busy nil)
         (elfeed-translate-max-concurrent 2)
         (elfeed-translate-max-consecutive-fatal 1)
@@ -94,7 +94,7 @@
                  (list :call-fn call-fn :texts (list text)
                        :prompt "prompt %s" :retries 0))
                '("one" "two" "three"))))
-        (elfeed-translate--process-batches-parallel queue '("feed"))
+        (elfeed-translate--process-batches queue '("feed"))
         (should (= calls 2))
         (funcall (nth 0 callbacks)
                  (elfeed-translate--failure-result
@@ -107,10 +107,10 @@
     (should (equal cached '(("two" . "二"))))
     (should (equal finalized '("feed")))
     (should-not elfeed-translate--busy)
-    (should-not elfeed-translate--parallel-state)))
+    (should-not elfeed-translate--dispatch-state)))
 
 (ert-deftest elfeed-translate-engine-sync-success-finalizes-once ()
-  (let ((elfeed-translate--parallel-state nil)
+  (let ((elfeed-translate--dispatch-state nil)
         (elfeed-translate--busy nil)
         (elfeed-translate-max-concurrent 2)
         (calls 0)
@@ -132,38 +132,15 @@
                  (list :call-fn call-fn :texts (list text)
                        :prompt "prompt %s" :retries 0))
                '("one" "two" "three"))))
-        (elfeed-translate--process-batches-parallel queue '("feed"))))
+        (elfeed-translate--process-batches queue '("feed"))))
     (should (= calls 3))
     (should (= writes 3))
     (should (= finalizes 1))
-    (should-not elfeed-translate--parallel-state)))
-
-(ert-deftest elfeed-translate-engine-serial-network-failure-stops-queue ()
-  (let ((elfeed-translate--serial-completed nil)
-        (elfeed-translate--serial-total nil)
-        (elfeed-translate--busy nil)
-        (calls 0)
-        (finalizes 0))
-    (cl-letf (((symbol-function 'elfeed-translate--finalize)
-               (lambda (_feeds) (cl-incf finalizes))))
-      (let* ((call-fn
-              (lambda (_texts callback _prompt)
-                (cl-incf calls)
-                (funcall callback
-                         (elfeed-translate--failure-result
-                          'send "proxy failed" nil))))
-             (element
-              (list :call-fn call-fn :texts '("one")
-                    :prompt "prompt %s" :retries 0)))
-        (elfeed-translate--process-batches
-         (list element (copy-sequence element)) '("feed"))))
-    (should (= calls 1))
-    (should (= finalizes 1))
-    (should-not elfeed-translate--busy)))
+    (should-not elfeed-translate--dispatch-state)))
 
 (ert-deftest elfeed-translate-engine-circuit-trips-after-K-failures ()
   "K consecutive transport failures trip the circuit and skip remaining batches."
-  (let ((elfeed-translate--parallel-state nil)
+  (let ((elfeed-translate--dispatch-state nil)
         (elfeed-translate--busy nil)
         (elfeed-translate-max-concurrent 4)
         (elfeed-translate-max-consecutive-fatal 3)
@@ -186,15 +163,15 @@
                         (list :call-fn call-fn :texts (list text)
                               :prompt "prompt %s" :retries 0))
                       '("a" "b" "c" "d"))))
-        (elfeed-translate--process-batches-parallel queue '("feed"))))
+        (elfeed-translate--process-batches queue '("feed"))))
     (should (= calls 3))
     (should (equal finalized '("feed")))
     (should-not elfeed-translate--busy)
-    (should-not elfeed-translate--parallel-state)))
+    (should-not elfeed-translate--dispatch-state)))
 
 (ert-deftest elfeed-translate-engine-429-throttle-pauses-then-resumes ()
   "A 429 pauses dispatch; after the throttle timer fires, the batch re-sends."
-  (let ((elfeed-translate--parallel-state nil)
+  (let ((elfeed-translate--dispatch-state nil)
         (elfeed-translate--busy nil)
         (elfeed-translate-max-concurrent 1)
         (elfeed-translate-max-throttle-wait 30)
@@ -227,18 +204,18 @@
              (queue
               (list (list :call-fn call-fn :texts '("one")
                           :prompt "prompt %s" :retries 0))))
-        (elfeed-translate--process-batches-parallel queue '("feed"))
+        (elfeed-translate--process-batches queue '("feed"))
         (should (= calls 1))
         (should-not finalized)
-        (should (plist-get elfeed-translate--parallel-state :throttle-until))
+        (should (plist-get elfeed-translate--dispatch-state :throttle-until))
         (dolist (ct captured-timers)
-          (when (eq (car ct) #'elfeed-translate--parallel-resume-throttle)
+          (when (eq (car ct) #'elfeed-translate--dispatch-resume-throttle)
             (apply (car ct) (cdr ct))))))
     (should (= calls 2))
     (should (equal cached '(("one" . "一"))))
     (should (equal finalized '("feed")))
     (should-not elfeed-translate--busy)
-    (should-not elfeed-translate--parallel-state)))
+    (should-not elfeed-translate--dispatch-state)))
 
 (ert-deftest elfeed-translate-engine-throttle-wait-clamps-large-retry-after ()
   "A provider Retry-After above the configured maximum is clamped."

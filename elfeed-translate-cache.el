@@ -1,7 +1,7 @@
 ;;; elfeed-translate-cache.el --- SQLite cache for elfeed-translate -*- lexical-binding: t; -*-
 
 ;; Author: pilrymage
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: news, rss, translation
 
