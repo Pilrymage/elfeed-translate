@@ -268,6 +268,28 @@ failures stop immediately."
   :type 'number
   :group 'elfeed-translate)
 
+(defcustom elfeed-translate-max-consecutive-fatal 3
+  "Maximum consecutive transport failures before aborting a parallel cycle.
+In parallel mode, transport failures (`network', `timeout', `send')
+and exhausted 429 throttling each increment a consecutive-fatal
+counter.  When the counter reaches this limit the cycle is aborted:
+pending batches are discarded and in-flight batches are allowed to
+drain.  A higher value tolerates more scattered transient errors
+before giving up; a lower value aborts sooner on sustained network
+or proxy problems.  Has no effect in serial mode."
+  :type 'integer
+  :group 'elfeed-translate)
+
+(defcustom elfeed-translate-max-throttle-wait 30
+  "Maximum seconds to pause dispatch when a provider returns HTTP 429.
+The provider's `Retry-After' header is honored as a hint but clamped
+to this value so an unreasonable response cannot freeze the cycle.
+When `Retry-After' is missing, a fallback derived from
+`elfeed-translate-retry-base-delay' is used.  Has no effect in
+serial mode."
+  :type 'number
+  :group 'elfeed-translate)
+
 (defcustom elfeed-translate-auto-refresh nil
   "When non-nil, automatically run `elfeed-update' after translation finishes.
 This lets Elfeed fetch the newly generated translated RSS files so

@@ -34,7 +34,7 @@ Users continue to load only =(require 'elfeed-translate)=.
 | =elfeed-translate-cache.el= | SQLite schema, migration, lookup, cache-key generation and transactional writes |
 | =elfeed-translate-api.el= | Request validation, HTTP transport, response parsing and diagnostics |
 | =elfeed-translate-elfeed.el= | Elfeed DB/tag access, entry extraction, feed paths, RSS rendering and display helpers |
-| =elfeed-translate-engine.el= | Collection, batching, retries, serial/parallel state, fail-fast abort, update hooks and finalization |
+| =elfeed-translate-engine.el= | Collection, batching, retries, serial/parallel state, circuit breaker, 429 throttle, update hooks and finalization |
 | =test/*.el= | Offline ERT tests, one suite per source module, plus the batch runner |
 
 Dependencies are deliberately one-way.  The facade requires the engine and
@@ -194,17 +194,46 @@ Retryable failures use exponential backoff with up to 25 percent jitter.  The
 delay is capped by =elfeed-translate-retry-max-delay=.  Serial and parallel
 dispatchers both hold =elfeed-translate--busy= across delayed retries.
 
-Fatal cycle-wide failures (=network=, =timeout=, =send=, =http=,
-=empty-response= and request/configuration failures) clear every unsent batch
-and cancel delayed retries.  Requests already in flight are drained.  The
-engine then writes any successful results, regenerates RSS once, clears busy
-state and reports completed/failed/skipped counts.
+** Parallel retry policy (circuit breaker + 429 throttle)
+
+Parallel mode does not fail-fast on transport errors.  Instead it combines a
+consecutive-fatal circuit breaker with a 429 throttle pause:
+
+- *Transport self-heal.*  A =network=, =timeout= or =send= failure is re-queued
+  once after a short backoff (the batch's =:heal-retries= goes 0 → 1).  Every
+  such failure, including the self-heal retry, increments the cycle's
+  =:consecutive-fatal= counter.  When the counter reaches
+  =elfeed-translate-max-consecutive-fatal= (default 3) the circuit trips:
+  pending batches are discarded, delayed retry timers are cancelled, and
+  in-flight batches are drained.  A batch whose self-heal is exhausted without
+  the circuit tripping is recorded as a permanent batch failure.
+
+- *429 throttle.*  An HTTP 429 pauses new dispatch until a =:throttle-until=
+  deadline.  The provider's =Retry-After= is honored as a hint and clamped to
+  =elfeed-translate-max-throttle-wait= (default 30 s); when missing, a fallback
+  derived from =elfeed-translate-retry-base-delay= is used.  The throttled batch
+  is re-queued (its =:throttle-retries= increments) and a timer resumes
+  dispatch when the deadline expires.  After two throttled retries a still-429
+  batch escalates to a consecutive-fatal failure.  429 never counts toward the
+  circuit on its own—only its escalation does.
+
+- *Other fatal failures.*  Configuration, request-validation, parse,
+  api-structure, non-429 HTTP and empty-response failures abort the cycle
+  immediately, exactly as in serial mode.
+
+The two circuits are orthogonal: 429 throttling does not block transport
+self-heal accounting, and a 429 pause does not exempt in-flight transport
+failures from incrementing =:consecutive-fatal=.  Serial mode is unchanged:
+transport and HTTP failures still abort on first contact.
 
 Parallel state lives in =elfeed-translate--parallel-state=, including
-=:queue=, =:in-flight=, =:retry-waiting=, =:completed= and =:total=.  Delayed
+=:queue=, =:in-flight=, =:retry-waiting=, =:completed=, =:total=,
+=:consecutive-fatal=, =:fatal-limit= and =:throttle-until=.  Delayed
 retries increment =:retry-waiting= so an empty queue cannot finalize early.
-Top-level callback/timer functions are used instead of self-referential local
-closures for reliable =eval-buffer= behavior.
+Throttled batches sit in =:queue= while =:throttle-until= is in the future, so
+the finalize guard also covers them.  Top-level callback/timer functions are
+used instead of self-referential local closures for reliable =eval-buffer=
+behavior.
 
 * SQLite Translation Cache
 

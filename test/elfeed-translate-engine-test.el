@@ -47,6 +47,7 @@
   (let ((elfeed-translate--parallel-state nil)
         (elfeed-translate--busy nil)
         (elfeed-translate-max-concurrent 4)
+        (elfeed-translate-max-consecutive-fatal 1)
         (calls 0)
         (finalized nil))
     (cl-letf (((symbol-function 'elfeed-translate--finalize)
@@ -74,6 +75,7 @@
   (let ((elfeed-translate--parallel-state nil)
         (elfeed-translate--busy nil)
         (elfeed-translate-max-concurrent 2)
+        (elfeed-translate-max-consecutive-fatal 1)
         (callbacks nil)
         (calls 0)
         (cached nil)
@@ -158,6 +160,97 @@
     (should (= calls 1))
     (should (= finalizes 1))
     (should-not elfeed-translate--busy)))
+
+(ert-deftest elfeed-translate-engine-circuit-trips-after-K-failures ()
+  "K consecutive transport failures trip the circuit and skip remaining batches."
+  (let ((elfeed-translate--parallel-state nil)
+        (elfeed-translate--busy nil)
+        (elfeed-translate-max-concurrent 4)
+        (elfeed-translate-max-consecutive-fatal 3)
+        (calls 0)
+        (finalized nil))
+    (cl-letf (((symbol-function 'elfeed-translate--finalize)
+               (lambda (feeds) (setq finalized feeds)))
+              ((symbol-function 'run-at-time)
+               (lambda (&rest _args) 'fake-timer))
+              ((symbol-function 'cancel-timer) (lambda (_t) nil))
+              ((symbol-function 'timerp) (lambda (_t) t)))
+      (let* ((call-fn
+              (lambda (_texts callback _prompt)
+                (cl-incf calls)
+                (funcall callback
+                         (elfeed-translate--failure-result
+                          'send "proxy failed" nil))))
+             (queue
+              (mapcar (lambda (text)
+                        (list :call-fn call-fn :texts (list text)
+                              :prompt "prompt %s" :retries 0))
+                      '("a" "b" "c" "d"))))
+        (elfeed-translate--process-batches-parallel queue '("feed"))))
+    (should (= calls 3))
+    (should (equal finalized '("feed")))
+    (should-not elfeed-translate--busy)
+    (should-not elfeed-translate--parallel-state)))
+
+(ert-deftest elfeed-translate-engine-429-throttle-pauses-then-resumes ()
+  "A 429 pauses dispatch; after the throttle timer fires, the batch re-sends."
+  (let ((elfeed-translate--parallel-state nil)
+        (elfeed-translate--busy nil)
+        (elfeed-translate-max-concurrent 1)
+        (elfeed-translate-max-throttle-wait 30)
+        (elfeed-translate-max-consecutive-fatal 3)
+        (calls 0)
+        (cached nil)
+        (finalized nil)
+        (captured-timers nil))
+    (cl-letf (((symbol-function 'elfeed-translate--cache-set-batch)
+               (lambda (pairs) (setq cached (append cached pairs))))
+              ((symbol-function 'elfeed-translate--finalize)
+               (lambda (feeds) (setq finalized feeds)))
+              ((symbol-function 'run-at-time)
+               (lambda (_time _repeat fn &rest args)
+                 (push (cons fn args) captured-timers)
+                 'fake-timer))
+              ((symbol-function 'cancel-timer) (lambda (_t) nil))
+              ((symbol-function 'timerp) (lambda (_t) t)))
+      (let* ((call-fn
+              (lambda (_texts callback _prompt)
+                (cl-incf calls)
+                (if (= calls 1)
+                    (funcall callback
+                             (elfeed-translate--failure-result
+                              'http "rate limited" nil
+                              :http-status 429 :retry-after 10))
+                  (funcall callback
+                           (elfeed-translate--success-result
+                            '(("one" . "一")) :http-status 200)))))
+             (queue
+              (list (list :call-fn call-fn :texts '("one")
+                          :prompt "prompt %s" :retries 0))))
+        (elfeed-translate--process-batches-parallel queue '("feed"))
+        (should (= calls 1))
+        (should-not finalized)
+        (should (plist-get elfeed-translate--parallel-state :throttle-until))
+        (dolist (ct captured-timers)
+          (when (eq (car ct) #'elfeed-translate--parallel-resume-throttle)
+            (apply (car ct) (cdr ct))))))
+    (should (= calls 2))
+    (should (equal cached '(("one" . "一"))))
+    (should (equal finalized '("feed")))
+    (should-not elfeed-translate--busy)
+    (should-not elfeed-translate--parallel-state)))
+
+(ert-deftest elfeed-translate-engine-throttle-wait-clamps-large-retry-after ()
+  "A provider Retry-After above the configured maximum is clamped."
+  (let ((elfeed-translate-max-throttle-wait 30)
+        (elfeed-translate-retry-base-delay 1.0))
+    (let ((result (elfeed-translate--failure-result
+                   'http "rate limited" nil
+                   :http-status 429 :retry-after 120)))
+      (should (<= (elfeed-translate--throttle-wait result) 30.0)))
+    (let ((result (elfeed-translate--failure-result
+                   'http "rate limited" nil :http-status 429)))
+      (should (>= (elfeed-translate--throttle-wait result) 2.0)))))
 
 (provide 'elfeed-translate-engine-test)
 ;;; elfeed-translate-engine-test.el ends here

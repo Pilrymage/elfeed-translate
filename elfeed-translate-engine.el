@@ -238,9 +238,10 @@ up to `elfeed-translate-max-retries' attempts.  Only failures marked
   "Plist holding parallel-dispatch state between async callbacks.
 Keys: :queue, :in-flight, :retry-waiting, :completed, :total,
 :failed, :skipped, :aborted, :dispatching, :retry-timers,
-:max-concurrent and :affected-feeds.  Queue elements are plists:
-(:call-fn :texts :prompt :retries).  Bound by
-`elfeed-translate--process-batches-parallel' and read by
+:max-concurrent, :affected-feeds, :consecutive-fatal,
+:fatal-limit and :throttle-until.  Queue elements are plists:
+(:call-fn :texts :prompt :retries :heal-retries :throttle-retries).
+Bound by `elfeed-translate--process-batches-parallel' and read by
 `elfeed-translate--parallel-dispatch' and
 `elfeed-translate--parallel-callback'.")
 
@@ -262,6 +263,7 @@ Keys: :queue, :in-flight, :retry-waiting, :completed, :total,
       (plist-put state :skipped (+ (plist-get state :skipped) unsent))
       (plist-put state :queue nil)
       (plist-put state :retry-waiting 0)
+      (plist-put state :throttle-until nil)
       (elfeed-translate--parallel-cancel-retry-timers state)
       (elfeed-translate--report-cycle-abort result unsent))))
 
@@ -297,6 +299,65 @@ Keys: :queue, :in-flight, :retry-waiting, :completed, :total,
              (= (plist-get state :retry-waiting) 0))
     (elfeed-translate--parallel-finalize state)))
 
+(defun elfeed-translate--self-heal-failure-p (result)
+  "Return non-nil when RESULT is a transport failure eligible for self-healing.
+These failures (`network', `timeout', `send') increment the
+consecutive-fatal counter and may be re-queued once before the batch
+is abandoned.  Serial mode does not use this predicate."
+  (memq (plist-get result :kind) '(network timeout send)))
+
+(defun elfeed-translate--throttle-failure-p (result)
+  "Return non-nil when RESULT is an HTTP 429 that should throttle dispatch.
+Unlike other HTTP errors, 429 signals rate limiting rather than a
+permanent fault: the cycle pauses, then resumes from the queue."
+  (and (eq (plist-get result :kind) 'http)
+       (eql (plist-get result :http-status) 429)))
+
+(defun elfeed-translate--throttle-wait (result)
+  "Return seconds to pause dispatch after a 429 RESULT.
+The provider's `Retry-After' value is used as a hint and clamped to
+`elfeed-translate-max-throttle-wait'.  When missing, a fallback of
+twice `elfeed-translate-retry-base-delay' (at least 2 seconds) is used."
+  (let* ((hint (plist-get result :retry-after))
+         (max-wait (max 0.0 (float elfeed-translate-max-throttle-wait)))
+         (fallback (max 2.0 (* 2.0 (float elfeed-translate-retry-base-delay)))))
+    (cond
+     ((and (numberp hint) (>= hint 0))
+      (if (> hint max-wait)
+          (progn
+            (message "[elfeed-translate] Throttle wait clamped: provider=%ds, max=%ds"
+                     (round hint) (round max-wait))
+            max-wait)
+        hint))
+     (t fallback))))
+
+(defun elfeed-translate--parallel-record-fatal (state result)
+  "Record a consecutive fatal failure in STATE and trip the circuit if needed.
+Increments `:consecutive-fatal' and, when it reaches `:fatal-limit',
+aborts the cycle with RESULT.  Returns t when the circuit tripped."
+  (let* ((count (1+ (or (plist-get state :consecutive-fatal) 0)))
+         (limit (plist-get state :fatal-limit)))
+    (plist-put state :consecutive-fatal count)
+    (when elfeed-translate-debug
+      (message "[elfeed-translate] Consecutive fatal: %d/%d" count limit))
+    (if (>= count limit)
+        (progn
+          (message
+           "[elfeed-translate] Circuit tripped: %d consecutive fatal, aborting"
+           count)
+          (elfeed-translate--parallel-abort state result)
+          t)
+      nil)))
+
+(defun elfeed-translate--parallel-resume-throttle (state)
+  "Resume dispatch after a 429 throttle pause expires for STATE.
+Clears `:throttle-until' and pumps the queue.  Stale calls from an
+older cycle are ignored."
+  (when (eq state elfeed-translate--parallel-state)
+    (plist-put state :throttle-until nil)
+    (elfeed-translate--parallel-dispatch)
+    (elfeed-translate--parallel-maybe-finalize state)))
+
 (defun elfeed-translate--parallel-requeue-retry (state element)
   "Put delayed retry ELEMENT back into parallel STATE's queue."
   (when (eq state elfeed-translate--parallel-state)
@@ -312,12 +373,29 @@ Keys: :queue, :in-flight, :retry-waiting, :completed, :total,
   "Completion callback for one parallel API batch.
 STATE identifies the cycle that dispatched ELEMENT.  RESULT is a
 structured API result.  Stale callbacks from an older cycle are
-ignored.  Retryable model-output failures use backoff; fatal network
-or provider failures abort every batch not yet sent."
+ignored.
+
+Failure handling:
+  - HTTP 429 throttles dispatch: the batch is re-queued and a
+    `:throttle-until' deadline pauses new dispatch until it expires.
+    After two throttled retries the batch escalates to a fatal
+    failure counted by the consecutive-fatal circuit.
+  - Transport failures (`network', `timeout', `send') self-heal
+    once: the batch is re-queued after a short backoff.  Every such
+    failure (including the self-heal retry) increments the
+    consecutive-fatal circuit, which aborts the cycle once
+    `:fatal-limit' is reached.
+  - Other fatal-cycle failures (configuration, parse, non-429 HTTP,
+    ...) abort the cycle immediately.
+  - Retryable model-output failures use exponential backoff up to
+    `elfeed-translate-max-retries'."
   (when (eq state elfeed-translate--parallel-state)
     (let* ((completed (plist-get state :completed))
            (total (plist-get state :total))
-           (retries (plist-get element :retries)))
+           (retries (plist-get element :retries))
+           (heal-retries (or (plist-get element :heal-retries) 0))
+           (throttle-retries (or (plist-get element :throttle-retries) 0))
+           (aborted (plist-get state :aborted)))
       (unwind-protect
           (progn
             (plist-put state :in-flight
@@ -330,11 +408,96 @@ or provider failures abort every batch not yet sent."
                 (message
                  "[elfeed-translate] Batch completed: %d ok (%d/%d)"
                  (length pairs) (1+ completed) total)))
+             ;; 429 throttling: pause dispatch and re-queue the batch.
+             ((and (not aborted)
+                   (elfeed-translate--throttle-failure-p result)
+                   (< throttle-retries 2))
+              (let* ((new-throttle (1+ throttle-retries))
+                     (wait (elfeed-translate--throttle-wait result))
+                     (throttle-until
+                      (time-add (current-time) (seconds-to-time wait)))
+                     (prior-until (plist-get state :throttle-until))
+                     (retry-element
+                      (plist-put (copy-sequence element)
+                                 :throttle-retries new-throttle))
+                     (timer
+                      (run-at-time
+                       wait nil #'elfeed-translate--parallel-resume-throttle
+                       state)))
+                (plist-put state :throttle-until
+                           (if (and prior-until
+                                    (time-less-p throttle-until prior-until))
+                               prior-until
+                             throttle-until))
+                (plist-put state :queue
+                           (append (plist-get state :queue)
+                                   (list retry-element)))
+                (plist-put state :retry-timers
+                           (cons timer (plist-get state :retry-timers)))
+                (when elfeed-translate-debug
+                  (message
+                   (concat "[elfeed-translate] Throttling for %.1fs "
+                           "(Retry-After=%s); batch requeued (throttle %d/2)")
+                   wait (or (plist-get result :retry-after) "none")
+                   new-throttle))))
+             ;; 429 exhausted: escalate to a consecutive fatal failure.
+             ((elfeed-translate--throttle-failure-p result)
+              (message
+               "[elfeed-translate] 429 batch escalated to fatal (throttle-retries=%d)"
+               throttle-retries)
+              (let ((tripped
+                     (elfeed-translate--parallel-record-fatal state result)))
+                (unless tripped
+                  (plist-put state :completed (1+ completed))
+                  (plist-put state :failed
+                             (1+ (plist-get state :failed)))
+                  (message
+                   "[elfeed-translate] Batch FAILED (%d/%d), not retrying: %s"
+                   (1+ completed) total
+                   (elfeed-translate--failure-summary result)))))
+             ;; Transport self-heal: re-queue once, circuit permitting.
+             ((and (not aborted)
+                   (elfeed-translate--self-heal-failure-p result)
+                   (< heal-retries 1))
+              (let ((tripped
+                     (elfeed-translate--parallel-record-fatal state result)))
+                (if tripped
+                    nil
+                  (let* ((delay (elfeed-translate--retry-delay result 0))
+                         (retry-element
+                          (plist-put (copy-sequence element)
+                                     :heal-retries (1+ heal-retries)))
+                         (timer
+                          (run-at-time
+                           delay nil #'elfeed-translate--parallel-requeue-retry
+                           state retry-element)))
+                    (plist-put state :retry-waiting
+                               (1+ (plist-get state :retry-waiting)))
+                    (plist-put state :retry-timers
+                               (cons timer (plist-get state :retry-timers)))
+                    (message
+                     (concat "[elfeed-translate] Batch transport failure: %s; "
+                             "self-heal retry in %.1fs (consecutive-fatal incremented)")
+                     (elfeed-translate--failure-summary result) delay)))))
+             ;; Transport exhausted (self-heal used up) or circuit tripped.
+             ((elfeed-translate--self-heal-failure-p result)
+              (let ((tripped
+                     (elfeed-translate--parallel-record-fatal state result)))
+                (unless tripped
+                  (plist-put state :completed (1+ completed))
+                  (plist-put state :failed
+                             (1+ (plist-get state :failed)))
+                  (message
+                   "[elfeed-translate] Batch FAILED (%d/%d), self-heal exhausted: %s"
+                   (1+ completed) total
+                   (elfeed-translate--failure-summary result)))))
+             ;; Other fatal-cycle failures abort immediately.
              ((elfeed-translate--fatal-cycle-failure-p result)
               (plist-put state :completed (1+ completed))
               (plist-put state :failed (1+ (plist-get state :failed)))
               (elfeed-translate--parallel-abort state result))
-             ((and (not (plist-get state :aborted))
+             ;; Retryable model-output failures with exponential backoff.
+             ((and (not aborted)
                    (plist-get result :retryable)
                    (< retries elfeed-translate-max-retries))
               (let* ((delay (elfeed-translate--retry-delay result retries))
@@ -367,8 +530,11 @@ or provider failures abort every batch not yet sent."
 (defun elfeed-translate--parallel-dispatch ()
   "Dispatch pending batches up to the concurrency limit.
 Reads `elfeed-translate--parallel-state'.  Queue elements are
-plists (:call-fn :texts :prompt :retries).  Passes the element to
-`elfeed-translate--parallel-callback' via a closure."
+plists (:call-fn :texts :prompt :retries :heal-retries
+:throttle-retries).  Passes the element to
+`elfeed-translate--parallel-callback' via a closure.  When
+`:throttle-until' is in the future, dispatch pauses until the
+throttle timer resumes it."
   (let ((state elfeed-translate--parallel-state))
     ;; A request function can invoke its callback synchronously when request
     ;; validation or DNS/proxy setup fails.  Prevent that callback from
@@ -380,6 +546,9 @@ plists (:call-fn :texts :prompt :retries).  Passes the element to
           (while (and (eq state elfeed-translate--parallel-state)
                       (not (plist-get state :aborted))
                       (plist-get state :queue)
+                      (let ((tu (plist-get state :throttle-until)))
+                        (not (and tu
+                                  (time-less-p (current-time) tu))))
                       (< (plist-get state :in-flight)
                          (plist-get state :max-concurrent)))
             (let* ((element (car (plist-get state :queue)))
@@ -437,7 +606,10 @@ late response from corrupting a newer cycle."
                 :dispatching nil
                 :total (length queue)
                 :max-concurrent (max 1 elfeed-translate-max-concurrent)
-                :affected-feeds affected-feeds))
+                :affected-feeds affected-feeds
+                :consecutive-fatal 0
+                :fatal-limit (max 1 elfeed-translate-max-consecutive-fatal)
+                :throttle-until nil))
     (setq elfeed-translate--busy t)
     (elfeed-translate--parallel-dispatch)))
 

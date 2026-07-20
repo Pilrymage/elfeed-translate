@@ -94,6 +94,8 @@ The equivalent =elfeed-org= tags are =:translate_title:= and
 | =elfeed-translate-max-retries= | =3= | Retries for translation-result failures |
 | =elfeed-translate-retry-base-delay= | =1.0= | Initial retry delay |
 | =elfeed-translate-retry-max-delay= | =30.0= | Maximum retry delay |
+| =elfeed-translate-max-consecutive-fatal= | =3= | Parallel circuit-breaker threshold |
+| =elfeed-translate-max-throttle-wait= | =30= | Max 429 =Retry-After= honored (seconds) |
 | =elfeed-translate-auto-refresh= | =nil= | Fetch local feeds after translation |
 | =elfeed-translate-debug= | =nil= | Detailed credential-safe diagnostics |
 
@@ -147,6 +149,24 @@ cycle occupied.
 Retryable failures use exponential backoff with jitter.  Both serial and
 parallel dispatchers hold the cycle-level busy lock while waiting, preventing a
 second translation cycle from starting over the same uncached entries.
+
+** Parallel failure handling
+
+Parallel mode replaces the serial fail-fast behavior with a circuit breaker
+and a 429 throttle, so scattered transient errors do not abort an otherwise
+healthy translation cycle:
+
+- Transport failures (=network=, =timeout=, =send=) self-heal once: the batch
+  is re-queued after a short backoff.  Each such failure increments a
+  consecutive-fatal counter; when it reaches =elfeed-translate-max-consecutive-fatal=
+  (default 3) the cycle aborts, discarding pending batches and draining
+  in-flight requests.
+- HTTP 429 pauses new dispatch until the provider's =Retry-After= (clamped to
+  =elfeed-translate-max-throttle-wait=, default 30 s) expires, then resumes from
+  the queue.  After two throttled retries a still-rate-limited batch escalates
+  to a fatal failure.
+- Other failures (configuration, non-429 HTTP, parse errors, ...) abort the
+  cycle immediately, as in serial mode.
 
 Network, proxy, DNS, timeout and provider HTTP failures abort the complete
 cycle.  No further queued batches are sent; already in-flight parallel requests
@@ -216,7 +236,7 @@ modules from the same repository:
 | =elfeed-translate-cache.el= | Fixed SQLite persistence, legacy DB merge and cache-key ownership |
 | =elfeed-translate-api.el= | Request encoding, HTTP and response parsing |
 | =elfeed-translate-elfeed.el= | Elfeed DB access, feed paths and RSS rendering |
-| =elfeed-translate-engine.el= | Collection, serial/parallel dispatch, fail-fast abort and update hooks |
+| =elfeed-translate-engine.el= | Collection, serial/parallel dispatch, circuit breaker, 429 throttle and update hooks |
 | =elfeed-translate.el= | Public commands, setup and global minor mode |
 
 The API returns source-text/translation pairs and has no knowledge of SQLite.
